@@ -1,0 +1,15 @@
+# 编译产物
+build/
+
+# 优化输出
+output/
+
+# 日志
+log/
+*.log
+
+# IDE
+.claude/
+
+# 临时文件
+*.tmp
