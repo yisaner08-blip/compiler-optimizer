@@ -60,6 +60,9 @@ int main(int argc, char *argv[]) {
   // 执行跨基本块的公共子表达式消除
   cross_block_cse();
 
+  // 常量传播与折叠（在循环优化之前，以简化循环条件）
+  constant_propagation();
+
   // 执行循环优化
   optimize_invariant_code_motion();      // 循环不变量外提
   optimize_strength_reduction();         // 强度削弱

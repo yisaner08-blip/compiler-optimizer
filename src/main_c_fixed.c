@@ -916,40 +916,18 @@ static void dataflow_solve_forward(int use_intersection) {
 /* 通用后向数据流求解器
  *   汇合: out[B] = 后继in的并集/交集
  *   传递: in[B] = gen[B] ∪ (out[B] - kill[B])
- *   遍历: 逆向后序遍历
+ *   遍历: 逆序（N-1→0），简单但保证收敛
  */
 static void dataflow_solve_backward(int use_intersection) {
-  /* 构建后序遍历 */
   int n = blocks->size;
-  int *visited = (int *)calloc(n, sizeof(int));
-  int *postorder = (int *)calloc(n, sizeof(int));
-  int po_idx = 0;
-
-  /* DFS 后序遍历 */
-  void dfs(int bb_idx) {
-    visited[bb_idx] = 1;
-    BasicBlock *bb = (BasicBlock *)vector_get(blocks, bb_idx);
-    for (int s = 0; s < bb->successors->size; s++) {
-      int succ_id = *(int *)vector_get(bb->successors, s);
-      int succ_idx = -1;
-      for (int k = 0; k < n; k++) {
-        if (((BasicBlock *)vector_get(blocks, k))->id == succ_id) { succ_idx = k; break; }
-      }
-      if (succ_idx >= 0 && !visited[succ_idx]) dfs(succ_idx);
-    }
-    postorder[po_idx++] = bb_idx;
-  }
-  dfs(0);
-
   int change = 1;
   while (change) {
     change = 0;
-    /* 后序遍历（正向 = 从Exit向Entry） */
-    for (int ii = 0; ii < n; ++ii) {
-      int i = postorder[ii];
+    /* 逆序遍历基本块 */
+    for (int i = n - 1; i >= 0; --i) {
       BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
 
-      /* 计算 out[B] = 汇合所有后继的 in */
+      /* out[B] = 汇合所有后继的 in */
       Set *out = set_create();
       int first = 1;
       for (int j = 0; j < b->successors->size; ++j) {
@@ -974,7 +952,7 @@ static void dataflow_solve_backward(int use_intersection) {
       set_free(b->out);
       b->out = out;
 
-      /* 计算 in[B] = gen[B] ∪ (out[B] - kill[B]) */
+      /* in[B] = gen[B] ∪ (out[B] - kill[B]) */
       Set *out_minus_kill = set_difference(b->out, b->kill);
       Set *new_in = set_union(b->gen, out_minus_kill);
       set_free(out_minus_kill);
@@ -988,9 +966,6 @@ static void dataflow_solve_backward(int use_intersection) {
       }
     }
   }
-
-  free(visited);
-  free(postorder);
 }
 
 // 到达-定值分析（前向 ∪ 汇合）
@@ -1362,6 +1337,141 @@ void cross_block_cse() {
     }
   }
   fprintf(outFile, "  [XBlockCSE] 替换了 %d 处跨块冗余计算为拷贝，删除 %d 条\n", replaced, removed);
+}
+
+// ==========================================
+// 5.5 常量传播与折叠 + 无用分支删除
+// ==========================================
+
+/* 尝试计算常量表达式的结果，成功返回1 */
+static int try_const_fold(const char *op, const char *a1, const char *a2, int *result) {
+  if (!is_constant(a1)) return 0;
+  int v1 = atoi(a1);
+
+  if (str_equal(op, "=")) {
+    *result = v1;
+    return 1;
+  }
+
+  if (!is_constant(a2)) return 0;
+  int v2 = atoi(a2);
+
+  if (str_equal(op, "+"))  { *result = v1 + v2; return 1; }
+  if (str_equal(op, "-"))  { *result = v1 - v2; return 1; }
+  if (str_equal(op, "*"))  { *result = v1 * v2; return 1; }
+  if (str_equal(op, "/"))  { if (v2 == 0) return 0; *result = v1 / v2; return 1; }
+  if (str_equal(op, "<"))  { *result = (v1 < v2);  return 1; }
+  if (str_equal(op, ">"))  { *result = (v1 > v2);  return 1; }
+  if (str_equal(op, "<=")) { *result = (v1 <= v2); return 1; }
+  if (str_equal(op, ">=")) { *result = (v1 >= v2); return 1; }
+  if (str_equal(op, "==")) { *result = (v1 == v2); return 1; }
+  if (str_equal(op, "!=")) { *result = (v1 != v2); return 1; }
+  return 0;
+}
+
+/* 常量传播 + 折叠 + 无用分支删除 */
+void constant_propagation() {
+  fprintf(outFile, "\n>>>>>>>> 常量传播与折叠 <<<<<<<<\n");
+  Map *const_map = map_create(); /* var_name -> (void*)(intptr_t)value */
+  int changed = 1;
+  int propagated = 0, folded = 0, branches_removed = 0;
+
+  while (changed) {
+    changed = 0;
+
+    for (int i = 0; i < blocks->size; ++i) {
+      BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
+      for (int j = 0; j < b->instructions->size; ++j) {
+        Quad *q = (Quad *)vector_get(b->instructions, j);
+        if (q->removed) continue;
+
+        const char *op = string_cstr(q->op);
+        const char *a1 = string_cstr(q->arg1);
+        const char *a2 = string_cstr(q->arg2);
+        const char *result = string_cstr(q->result);
+
+        /* 替换操作数中的变量为常量 */
+        if (is_variable(a1) && map_contains(const_map, a1)) {
+          int val = (int)(intptr_t)map_get(const_map, a1, (void*)0);
+          char buf[16]; sprintf(buf, "%d", val);
+          string_clear(q->arg1); string_append(q->arg1, buf);
+          propagated++; changed = 1;
+          a1 = string_cstr(q->arg1);
+        }
+        if (is_variable(a2) && map_contains(const_map, a2)) {
+          int val = (int)(intptr_t)map_get(const_map, a2, (void*)0);
+          char buf[16]; sprintf(buf, "%d", val);
+          string_clear(q->arg2); string_append(q->arg2, buf);
+          propagated++; changed = 1;
+          a2 = string_cstr(q->arg2);
+        }
+
+        /* 尝试常量折叠（仅在非循环块中进行，避免循环内错误折叠） */
+        int fold_result;
+        if (b->id <= 2 && /* 仅入口块和初始块 */
+            !str_equal(op, "=") && !quad_is_branch(q) &&
+            !str_equal(op, "label") && !str_equal(op, "func") &&
+            !str_equal(op, "[]=") && !str_equal(op, "=[]") &&
+            try_const_fold(op, a1, a2, &fold_result)) {
+          /* 将指令替换为 (=, const, _, result) */
+          if (is_variable(result)) {
+            string_clear(q->op); string_append(q->op, "=");
+            char buf[16]; sprintf(buf, "%d", fold_result);
+            string_clear(q->arg1); string_append(q->arg1, buf);
+            string_clear(q->arg2); string_append(q->arg2, "null");
+            map_insert(const_map, result, (void*)(intptr_t)fold_result);
+            folded++; changed = 1;
+            fprintf(outFile, "  [ConstFold] %s = %d\n", result, fold_result);
+          }
+        }
+
+        /* 记录 (=, const, _, var) 到常量表 */
+        /* 仅记录循环外的常量，循环内的赋值会随迭代变化，不可视为常量 */
+        if (str_equal(op, "=") && is_constant(a1) && is_variable(result)) {
+          int val = atoi(a1);
+          /* 简单判断：如果指令所在块ID较小（在循环之前），记录为常量 */
+          if (!map_contains(const_map, result) && b->id <= 2) {
+            map_insert(const_map, result, (void*)(intptr_t)val);
+            changed = 1;
+            fprintf(outFile, "  [ConstProp] %s = %d (常量)\n", result, val);
+          }
+        }
+      }
+    }
+  }
+
+  /* 无用分支删除：if (0, _, L) → 永不跳转，删除 if；if (1, _, L) → 必定跳转，改 goto */
+  for (int i = 0; i < blocks->size; ++i) {
+    BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
+    for (int j = 0; j < b->instructions->size; ++j) {
+      Quad *q = (Quad *)vector_get(b->instructions, j);
+      if (q->removed) continue;
+      if (!str_equal(string_cstr(q->op), "if")) continue;
+
+      const char *cond = string_cstr(q->arg1);
+      if (!is_constant(cond)) continue;
+
+      int cond_val = atoi(cond);
+      const char *target = string_cstr(q->result);
+
+      if (cond_val == 0) {
+        /* 条件恒假 → 删除 if，让控制流自然落到下一块 */
+        q->removed = 1;
+        branches_removed++;
+        fprintf(outFile, "  [BranchDel] 删除恒假分支 if(%d) → %s\n", cond_val, target);
+      } else {
+        /* 条件恒真 → 将 if 改为 goto */
+        string_clear(q->op); string_append(q->op, "goto");
+        q->removed = 0;
+        branches_removed++;
+        fprintf(outFile, "  [BranchFold] if(%d)→goto %s\n", cond_val, target);
+      }
+    }
+  }
+
+  fprintf(outFile, "  [ConstProp] 传播 %d 次, 折叠 %d 次, 删除无用分支 %d 个\n",
+          propagated, folded, branches_removed);
+  map_free(const_map);
 }
 
 // ==========================================

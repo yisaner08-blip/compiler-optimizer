@@ -194,6 +194,9 @@ void perform_all_analyses();
 /** @brief 基于可用表达式分析的跨基本块公共子表达式消除 */
 void cross_block_cse();
 
+/** @brief 常量传播、常量折叠和无用分支删除 */
+void constant_propagation();
+
 // ** 循环分析与优化 **
 
 /** @brief 在CFG中通过寻找回边来识别所有循环 */
