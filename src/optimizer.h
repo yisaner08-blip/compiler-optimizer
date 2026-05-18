@@ -234,6 +234,9 @@ void load_file(const char *path);
 /** @brief 删除未被使用的变量定义（死代码） */
 void eliminate_dead_code();
 
+/** @brief 删除没有前驱的无用基本块 */
+void dead_block_elimination();
+
 /** @brief 将所有外提的指令移动到程序的入口块 */
 void move_preheader_to_start();
 

@@ -1370,11 +1370,21 @@ static int try_const_fold(const char *op, const char *a1, const char *a2, int *r
 }
 
 /* 常量传播 + 折叠 + 无用分支删除 */
+/* 获取复制链的最终源头（处理 a→b→c 链） */
+static const char *resolve_copy_chain(const char *var, Map *copy_map, int depth) {
+  if (depth > 10) return var; /* 防止循环引用 */
+  if (!map_contains(copy_map, var)) return var;
+  const char *src = (const char *)map_get(copy_map, var, (void*)0);
+  if (!src || str_equal(src, var)) return var;
+  return resolve_copy_chain(src, copy_map, depth + 1);
+}
+
 void constant_propagation() {
   fprintf(outFile, "\n>>>>>>>> 常量传播与折叠 <<<<<<<<\n");
   Map *const_map = map_create(); /* var_name -> (void*)(intptr_t)value */
+  Map *copy_map = map_create();  /* var_name -> source_var_name */
   int changed = 1;
-  int propagated = 0, folded = 0, branches_removed = 0;
+  int propagated = 0, folded = 0, branches_removed = 0, copied = 0;
 
   while (changed) {
     changed = 0;
@@ -1390,20 +1400,38 @@ void constant_propagation() {
         const char *a2 = string_cstr(q->arg2);
         const char *result = string_cstr(q->result);
 
-        /* 替换操作数中的变量为常量 */
-        if (is_variable(a1) && map_contains(const_map, a1)) {
-          int val = (int)(intptr_t)map_get(const_map, a1, (void*)0);
-          char buf[16]; sprintf(buf, "%d", val);
-          string_clear(q->arg1); string_append(q->arg1, buf);
-          propagated++; changed = 1;
-          a1 = string_cstr(q->arg1);
+        /* 替换操作数：先查常量表，再查复制表 */
+        if (is_variable(a1) && !is_constant(a1)) {
+          if (map_contains(const_map, a1)) {
+            int val = (int)(intptr_t)map_get(const_map, a1, (void*)0);
+            char buf[16]; sprintf(buf, "%d", val);
+            string_clear(q->arg1); string_append(q->arg1, buf);
+            propagated++; changed = 1;
+            a1 = string_cstr(q->arg1);
+          } else if (map_contains(copy_map, a1)) {
+            const char *src = resolve_copy_chain(a1, copy_map, 0);
+            if (!str_equal(src, a1)) {
+              string_clear(q->arg1); string_append(q->arg1, src);
+              copied++; changed = 1;
+              a1 = string_cstr(q->arg1);
+            }
+          }
         }
-        if (is_variable(a2) && map_contains(const_map, a2)) {
-          int val = (int)(intptr_t)map_get(const_map, a2, (void*)0);
-          char buf[16]; sprintf(buf, "%d", val);
-          string_clear(q->arg2); string_append(q->arg2, buf);
-          propagated++; changed = 1;
-          a2 = string_cstr(q->arg2);
+        if (is_variable(a2) && !is_constant(a2)) {
+          if (map_contains(const_map, a2)) {
+            int val = (int)(intptr_t)map_get(const_map, a2, (void*)0);
+            char buf[16]; sprintf(buf, "%d", val);
+            string_clear(q->arg2); string_append(q->arg2, buf);
+            propagated++; changed = 1;
+            a2 = string_cstr(q->arg2);
+          } else if (map_contains(copy_map, a2)) {
+            const char *src = resolve_copy_chain(a2, copy_map, 0);
+            if (!str_equal(src, a2)) {
+              string_clear(q->arg2); string_append(q->arg2, src);
+              copied++; changed = 1;
+              a2 = string_cstr(q->arg2);
+            }
+          }
         }
 
         /* 尝试常量折叠（仅在非循环块中进行，避免循环内错误折叠） */
@@ -1425,22 +1453,32 @@ void constant_propagation() {
           }
         }
 
-        /* 记录 (=, const, _, var) 到常量表 */
-        /* 仅记录循环外的常量，循环内的赋值会随迭代变化，不可视为常量 */
+        /* 记录常量 */
         if (str_equal(op, "=") && is_constant(a1) && is_variable(result)) {
           int val = atoi(a1);
-          /* 简单判断：如果指令所在块ID较小（在循环之前），记录为常量 */
           if (!map_contains(const_map, result) && b->id <= 2) {
             map_insert(const_map, result, (void*)(intptr_t)val);
+            /* 如果此变量之前在copy_map中，移除（现在有更精确的常量值） */
             changed = 1;
             fprintf(outFile, "  [ConstProp] %s = %d (常量)\n", result, val);
+          }
+        }
+
+        /* 记录复制关系: (=, var, _, result) 且 var 是变量 */
+        if (str_equal(op, "=") && is_variable(a1) && !is_constant(a1) &&
+            is_variable(result) && b->id <= 2) {
+          if (!map_contains(copy_map, result) && !map_contains(const_map, result)) {
+            const char *src = resolve_copy_chain(a1, copy_map, 0);
+            map_insert(copy_map, result, (void*)src);
+            changed = 1;
+            fprintf(outFile, "  [CopyProp] %s = %s (复制)\n", result, src);
           }
         }
       }
     }
   }
 
-  /* 无用分支删除：if (0, _, L) → 永不跳转，删除 if；if (1, _, L) → 必定跳转，改 goto */
+  /* 无用分支删除 */
   for (int i = 0; i < blocks->size; ++i) {
     BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
     for (int j = 0; j < b->instructions->size; ++j) {
@@ -1455,12 +1493,12 @@ void constant_propagation() {
       const char *target = string_cstr(q->result);
 
       if (cond_val == 0) {
-        /* 条件恒假 → 删除 if，让控制流自然落到下一块 */
+        /* if(0) → 永不跳转，删除 if */
         q->removed = 1;
         branches_removed++;
         fprintf(outFile, "  [BranchDel] 删除恒假分支 if(%d) → %s\n", cond_val, target);
       } else {
-        /* 条件恒真 → 将 if 改为 goto */
+        /* if(非0) → 必定跳转，改为 goto */
         string_clear(q->op); string_append(q->op, "goto");
         q->removed = 0;
         branches_removed++;
@@ -1469,9 +1507,10 @@ void constant_propagation() {
     }
   }
 
-  fprintf(outFile, "  [ConstProp] 传播 %d 次, 折叠 %d 次, 删除无用分支 %d 个\n",
-          propagated, folded, branches_removed);
+  fprintf(outFile, "  [ConstProp] 常量传播 %d 次, 折叠 %d 次, 复制传播 %d 次, 分支删除 %d 个\n",
+          propagated, folded, copied, branches_removed);
   map_free(const_map);
+  map_free(copy_map);
 }
 
 // ==========================================
@@ -1529,7 +1568,7 @@ static int *compute_dominators(int n_blocks) {
   /* 从入口块（block 1, 0-based index 0）开始 DFS */
   postorder_dfs(0, visited, postorder, &po_idx);
 
-  /* 验证后序遍历覆盖了所有可达结点 */
+  /* 验证所有块可达 */
   assert(po_idx == n_blocks && "CFG 中存在不可达的基本块");
 
   compute_postorder_map(postorder, n_blocks, po_map);
@@ -1540,12 +1579,12 @@ static int *compute_dominators(int n_blocks) {
   }
   idoms[0] = 0; /* 入口块支配自身 */
 
-  /* 不动点迭代 */
+  /* 不动点迭代（仅处理可达块） */
   int change;
   do {
     change = 0;
-    /* 逆后序遍历（排除入口块，即最后一个后序结点） */
-    for (int i = n_blocks - 2; i >= 0; i--) {
+    /* 逆后序遍历，排除入口块（最后一个）和不可达块 */
+    for (int i = po_idx - 2; i >= 0; i--) {
       int bb = postorder[i];
       BasicBlock *b = find_block_by_id(bb + 1);
       if (!b || b->predecessors->size == 0) continue;
@@ -1555,7 +1594,7 @@ static int *compute_dominators(int n_blocks) {
       for (int j = 0; j < b->predecessors->size; j++) {
         int pred = *(int *)vector_get(b->predecessors, j);
         int pred_idx = pred - 1;
-        if (idoms[pred_idx] != UNDEFINED_IDOM) {
+        if (pred_idx >= 0 && pred_idx < n_blocks && idoms[pred_idx] != UNDEFINED_IDOM) {
           new_idom = pred_idx;
           break;
         }
@@ -1566,7 +1605,8 @@ static int *compute_dominators(int n_blocks) {
         for (int j = 0; j < b->predecessors->size; j++) {
           int pred = *(int *)vector_get(b->predecessors, j);
           int pred_idx = pred - 1;
-          if (pred_idx != new_idom && idoms[pred_idx] != UNDEFINED_IDOM) {
+          if (pred_idx >= 0 && pred_idx < n_blocks &&
+              pred_idx != new_idom && idoms[pred_idx] != UNDEFINED_IDOM) {
             new_idom = intersect(new_idom, pred_idx, idoms, po_map);
           }
         }
@@ -1586,11 +1626,13 @@ static int *compute_dominators(int n_blocks) {
 }
 
 /* 查询 a 是否支配 b（a 和 b 均为 0-based 索引） */
-static int dominates(int a, int b, const int *idoms) {
+static int dominates(int a, int b, const int *idoms, int n_blocks) {
   if (a == 0) return 1; /* 入口块支配所有 */
+  if (idoms[b] == UNDEFINED_IDOM) return 0; /* 不可达块 */
   int runner = idoms[b];
   while (runner != 0) {
     if (runner == a) return 1;
+    if (runner == UNDEFINED_IDOM || runner >= n_blocks) return 0;
     runner = idoms[runner];
   }
   return 0;
@@ -1614,12 +1656,15 @@ static NaturalLoop *detect_natural_loops(int *idoms, int n_blocks, int *loop_cou
   for (int n = 0; n < n_blocks; n++) {
     BasicBlock *b = find_block_by_id(n + 1);
     if (!b) continue;
+    /* 跳过不可达块（idom 未定义） */
+    if (idoms[n] == UNDEFINED_IDOM) continue;
     for (int s = 0; s < b->successors->size; s++) {
       int h = *(int *)vector_get(b->successors, s);
       int h_idx = h - 1;
+      if (h_idx < 0 || h_idx >= n_blocks) continue;
 
       /* 回边：h dominates n */
-      if (dominates(h_idx, n, idoms)) {
+      if (dominates(h_idx, n, idoms, n_blocks)) {
         /* 收集循环体：从 n 反向 BFS，不经过 h */
         int *in_loop = (int *)calloc(n_blocks, sizeof(int));
         int *queue = (int *)malloc(n_blocks * sizeof(int));
@@ -2792,6 +2837,65 @@ void eliminate_dead_code() {
   }
 
   fprintf(outFile, "  [DCE] 共删除 %d 条死代码指令\n", total_deleted);
+}
+
+// 删除无用基本块（没有前驱的块，不可达代码）
+void dead_block_elimination() {
+  fprintf(outFile, "\n>>>>>>>> 删除无用基本块 <<<<<<<<\n");
+  int removed_blocks = 0, removed_instrs = 0;
+
+  /* 迭代删除，因为删除一个块可能使其他块也失去前驱 */
+  int changed = 1;
+  while (changed) {
+    changed = 0;
+    for (int i = 1; i < blocks->size; ++i) { /* 跳过 entry 块(0) */
+      BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
+      if (!b) continue;
+
+      /* 检查是否有前驱（排除自己） */
+      int has_pred = 0;
+      for (int p = 0; p < b->predecessors->size; ++p) {
+        int pred_id = *(int *)vector_get(b->predecessors, p);
+        if (pred_id != b->id) { has_pred = 1; break; }
+      }
+
+      if (!has_pred) {
+        fprintf(outFile, "  [DeadBlock] 删除块 %d (无前驱)\n", b->id);
+        /* 标记所有指令为删除 */
+        for (int j = 0; j < b->instructions->size; ++j) {
+          Quad *q = (Quad *)vector_get(b->instructions, j);
+          if (!q->removed) { q->removed = 1; removed_instrs++; }
+        }
+        /* 从后继的前驱列表中移除本块 */
+        for (int s = 0; s < b->successors->size; ++s) {
+          int succ_id = *(int *)vector_get(b->successors, s);
+          BasicBlock *succ = find_block_by_id(succ_id);
+          if (succ) {
+            /* 清理后继的前驱列表 */
+            Vector *new_preds = vector_create();
+            for (int p = 0; p < succ->predecessors->size; ++p) {
+              int pid = *(int *)vector_get(succ->predecessors, p);
+              if (pid != b->id) {
+                int *np = (int *)malloc(sizeof(int)); *np = pid;
+                vector_push_back(new_preds, np);
+              }
+            }
+            vector_free(succ->predecessors, free);
+            succ->predecessors = new_preds;
+          }
+        }
+        /* 清空本块的前驱和后继（标记为死块） */
+        vector_free(b->predecessors, free);
+        b->predecessors = vector_create();
+        vector_free(b->successors, free);
+        b->successors = vector_create();
+        removed_blocks++;
+        changed = 1;
+      }
+    }
+  }
+
+  fprintf(outFile, "  [DeadBlock] 删除 %d 个无用块, %d 条指令\n", removed_blocks, removed_instrs);
 }
 
 // 将所有preHeader指令移到第一个基本块
