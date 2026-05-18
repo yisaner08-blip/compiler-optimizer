@@ -2075,13 +2075,32 @@ void simplify_instructions() {
                         str_equal(string_cstr(q1->result), string_cstr(q2->arg1)) &&
                         is_variable(string_cstr(q1->result))) {
 
-                        // Check if the temporary is used anywhere else between q1 and q2
-                        // (In this case, they are adjacent, so this check is trivial)
-
-                        // Perform the simplification
+                        // 安全检查：中间变量 t 不能在其他地方被使用
+                        // （除了 q2 这个赋值指令本身）
+                        const char *temp_var = string_cstr(q1->result);
+                        int temp_used_elsewhere = 0;
+                        for (int bi = 0; bi < blocks->size && !temp_used_elsewhere; ++bi) {
+                          BasicBlock *bb = (BasicBlock *)vector_get(blocks, bi);
+                          for (int bj = 0; bj < bb->instructions->size; ++bj) {
+                            Quad *oq = (Quad *)vector_get(bb->instructions, bj);
+                            if (oq->removed || oq == q1 || oq == q2) continue;
+                            if (str_equal(string_cstr(oq->arg1), temp_var) ||
+                                str_equal(string_cstr(oq->arg2), temp_var) ||
+                                str_equal(string_cstr(oq->arg3), temp_var)) {
+                              temp_used_elsewhere = 1;
+                              break;
+                            }
+                          }
+                        }
+                        if (temp_used_elsewhere) {
+                          fprintf(outFile, "  [Simplify] 跳过合并 %d+%d: '%s' 在其他指令中使用\n",
+                                  q1->id, q2->id, temp_var);
+                          // 不合并，但 q1 仍会通过循环末尾的 push 加入
+                        } else {
+                          // Perform the simplification
                         fprintf(outFile,
                                 "  [Simplify] Merging instructions %d and %d. Replacing result '%s' with '%s'.\n",
-                                q1->id, q2->id, string_cstr(q1->result), string_cstr(q2->result));
+                                q1->id, q2->id, temp_var, string_cstr(q2->result));
 
                         // Update q1's result
                         string_clear(q1->result);
@@ -2091,6 +2110,7 @@ void simplify_instructions() {
                         q2->removed = 1;
                         simplified_count++;
                         changed = 1;
+                        } /* end else (merge allowed) */
                     }
                 }
                 vector_push_back(new_instructions, q1);
