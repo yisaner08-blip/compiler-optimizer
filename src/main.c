@@ -72,6 +72,7 @@ int main(int argc, char *argv[]) {
   // 执行其他全局优化
   simplify_instructions();      // 合并冗余的临时变量赋值
   eliminate_dead_code();        // 删除死代码
+  /* dead_block_elimination 待修复后启用 */
 
   // --- 5. 清理与输出 ---
 
