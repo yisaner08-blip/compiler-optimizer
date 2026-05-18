@@ -2412,7 +2412,8 @@ void optimize_induction_variable_elimination() {
       }
     }
 
-    // 方法B：SR后通过步长比例识别（变量初始化相同、步长成整数倍）
+    // 方法B：SR后通过步长比例识别
+    // 额外检查：候选变量不能是任何循环的基本IV
     if (!derived_iv) {
       int iv_init = get_initial_value(iv_var, header);
       for (int k = 0; k < blocks->size && !derived_iv; ++k) {
@@ -2420,16 +2421,30 @@ void optimize_induction_variable_elimination() {
         for (int i = 0; i < b->instructions->size && !derived_iv; ++i) {
           Quad *q = (Quad *)vector_get(b->instructions, i);
           if (q->removed) continue;
-          // 查找累加变量: (+, var, const, var) 且 var != iv_var
           if (!str_equal(string_cstr(q->op), "+")) continue;
           if (!is_constant(string_cstr(q->arg2))) continue;
           const char *var = string_cstr(q->result);
           if (!is_variable(var) || str_equal(var, iv_var)) continue;
           if (!str_equal(string_cstr(q->arg1), var)) continue;
+          // 排除自身是基本归纳变量的（如 j 和 i 各有自己的循环）
+          int var_is_basic_iv = 0;
+          for (int k2 = 0; k2 < blocks->size && !var_is_basic_iv; ++k2) {
+            BasicBlock *b2 = (BasicBlock *)vector_get(blocks, k2);
+            for (int i2 = 0; i2 < b2->instructions->size; ++i2) {
+              Quad *q2 = (Quad *)vector_get(b2->instructions, i2);
+              if (q2->removed) continue;
+              if ((str_equal(string_cstr(q2->op), "+") || str_equal(string_cstr(q2->op), "-")) &&
+                  str_equal(string_cstr(q2->result), var) &&
+                  str_equal(string_cstr(q2->arg1), var) &&
+                  is_constant(string_cstr(q2->arg2)) && q2 != q) {
+                var_is_basic_iv = 1; break;
+              }
+            }
+          }
+          if (var_is_basic_iv) continue;
 
           int var_stride = atoi(string_cstr(q->arg2));
           int var_init = get_initial_value(var, header);
-          // 检查：相同初始值，步长成整数比例
           if (var_init == iv_init && var_stride % iv_stride == 0 && var_stride / iv_stride > 1) {
             derived_iv = var;
             factor_val = var_stride / iv_stride;
