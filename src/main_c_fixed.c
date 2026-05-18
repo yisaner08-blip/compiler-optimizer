@@ -853,54 +853,55 @@ int set_equal(const Set *s1, const Set *s2) {
   return equal;
 }
 
-// 到达-定值分析
-void reaching_definitions() {
-  fprintf(outFile, "\n[分析] 1.1 到达-定值分析...\n");
+// ==========================================
+// 通用数据流分析求解器
+// ==========================================
 
-  // 1. 计算每个基本块的gen和kill集合
-  compute_gen_kill();
+/* 集合汇合操作类型 */
+typedef Set *(*ConfluenceOp)(const Set *, const Set *);
 
-  // 2. 初始化out集合
-  for (int i = 0; i < blocks->size; ++i) {
-    BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
-    b->out = set_create();
-    b->in = set_create();
-  }
-
-  // 3. 迭代计算in和out集合
+/* 通用前向数据流求解器
+ *   汇合: in[B] = 前驱out的并集/交集
+ *   传递: out[B] = gen[B] ∪ (in[B] - kill[B])
+ *   遍历: 正向（0→N-1）
+ */
+static void dataflow_solve_forward(int use_intersection) {
   int change = 1;
   while (change) {
     change = 0;
-
     for (int i = 0; i < blocks->size; ++i) {
       BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
 
-      // 保存旧的out集合
-      Set *old_out = set_create();
-      set_inorder_traverse_insert(b->out->root, old_out);
-
-      // 计算in[B] = 所有前驱的out的并集
+      /* 计算 in[B] = 汇合所有前驱的 out */
       Set *in = set_create();
+      int first = 1;
       for (int j = 0; j < b->predecessors->size; ++j) {
         int pred_id = *(int *)vector_get(b->predecessors, j);
         BasicBlock *pred_b = find_block_by_id(pred_id);
-        if (pred_b) {
-            Set *temp = set_union(in, pred_b->out);
-            set_free(in);
-            in = temp;
+        if (!pred_b) continue;
+        if (first) {
+          set_inorder_traverse_insert(pred_b->out->root, in);
+          first = 0;
+        } else {
+          Set *temp;
+          if (use_intersection) {
+            temp = set_intersection(in, pred_b->out);
+          } else {
+            temp = set_union(in, pred_b->out);
+          }
+          set_free(in);
+          in = temp;
         }
       }
 
-      // 更新in集合
       set_free(b->in);
       b->in = in;
 
-      // 计算out[B] = gen[B] ∪ (in[B] - kill[B])
+      /* 计算 out[B] = gen[B] ∪ (in[B] - kill[B]) */
       Set *in_minus_kill = set_difference(b->in, b->kill);
       Set *new_out = set_union(b->gen, in_minus_kill);
       set_free(in_minus_kill);
 
-      // 检查out集合是否发生变化
       if (!set_equal(new_out, b->out)) {
         change = 1;
         set_free(b->out);
@@ -908,12 +909,106 @@ void reaching_definitions() {
       } else {
         set_free(new_out);
       }
+    }
+  }
+}
 
-      set_free(old_out);
+/* 通用后向数据流求解器
+ *   汇合: out[B] = 后继in的并集/交集
+ *   传递: in[B] = gen[B] ∪ (out[B] - kill[B])
+ *   遍历: 逆向后序遍历
+ */
+static void dataflow_solve_backward(int use_intersection) {
+  /* 构建后序遍历 */
+  int n = blocks->size;
+  int *visited = (int *)calloc(n, sizeof(int));
+  int *postorder = (int *)calloc(n, sizeof(int));
+  int po_idx = 0;
+
+  /* DFS 后序遍历 */
+  void dfs(int bb_idx) {
+    visited[bb_idx] = 1;
+    BasicBlock *bb = (BasicBlock *)vector_get(blocks, bb_idx);
+    for (int s = 0; s < bb->successors->size; s++) {
+      int succ_id = *(int *)vector_get(bb->successors, s);
+      int succ_idx = -1;
+      for (int k = 0; k < n; k++) {
+        if (((BasicBlock *)vector_get(blocks, k))->id == succ_id) { succ_idx = k; break; }
+      }
+      if (succ_idx >= 0 && !visited[succ_idx]) dfs(succ_idx);
+    }
+    postorder[po_idx++] = bb_idx;
+  }
+  dfs(0);
+
+  int change = 1;
+  while (change) {
+    change = 0;
+    /* 后序遍历（正向 = 从Exit向Entry） */
+    for (int ii = 0; ii < n; ++ii) {
+      int i = postorder[ii];
+      BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
+
+      /* 计算 out[B] = 汇合所有后继的 in */
+      Set *out = set_create();
+      int first = 1;
+      for (int j = 0; j < b->successors->size; ++j) {
+        int succ_id = *(int *)vector_get(b->successors, j);
+        BasicBlock *succ_b = find_block_by_id(succ_id);
+        if (!succ_b) continue;
+        if (first) {
+          set_inorder_traverse_insert(succ_b->in->root, out);
+          first = 0;
+        } else {
+          Set *temp;
+          if (use_intersection) {
+            temp = set_intersection(out, succ_b->in);
+          } else {
+            temp = set_union(out, succ_b->in);
+          }
+          set_free(out);
+          out = temp;
+        }
+      }
+
+      set_free(b->out);
+      b->out = out;
+
+      /* 计算 in[B] = gen[B] ∪ (out[B] - kill[B]) */
+      Set *out_minus_kill = set_difference(b->out, b->kill);
+      Set *new_in = set_union(b->gen, out_minus_kill);
+      set_free(out_minus_kill);
+
+      if (!set_equal(new_in, b->in)) {
+        change = 1;
+        set_free(b->in);
+        b->in = new_in;
+      } else {
+        set_free(new_in);
+      }
     }
   }
 
-  // 4. 打印结果
+  free(visited);
+  free(postorder);
+}
+
+// 到达-定值分析（前向 ∪ 汇合）
+void reaching_definitions() {
+  fprintf(outFile, "\n[分析] 1.1 到达-定值分析...\n");
+
+  compute_gen_kill();
+
+  /* 初始化: out[Entry]=空 */
+  for (int i = 0; i < blocks->size; ++i) {
+    BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
+    b->out = set_create();
+    b->in = set_create();
+  }
+
+  dataflow_solve_forward(0); /* 0 = union confluence */
+
+  /* 打印结果 */
   for (int i = 0; i < blocks->size; ++i) {
     const BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
     fprintf(outFile, "Block %d IN: { ", b->id);
@@ -921,12 +1016,6 @@ void reaching_definitions() {
     fprintf(outFile, "}\n");
     fprintf(outFile, "Block %d OUT: { ", b->id);
     print_set(outFile, b->out, 10);
-    fprintf(outFile, "}\n");
-    fprintf(outFile, "Block %d GEN: { ", b->id);
-    print_set(outFile, b->gen, 5);
-    fprintf(outFile, "}\n");
-    fprintf(outFile, "Block %d KILL: { ", b->id);
-    print_set(outFile, b->kill, 5);
     fprintf(outFile, "}\n");
   }
 }
@@ -979,69 +1068,22 @@ void compute_use_def() {
   }
 }
 
-// 活跃变量分析
+// 活跃变量分析（后向 ∪ 汇合）
 void live_variables() {
   fprintf(outFile, "\n[分析] 1.2 活跃变量分析...\n");
 
-  // 1. 计算每个基本块的use和def集合
   compute_use_def();
 
-  // 2. 初始化in集合
+  /* 初始化: in[Exit]=空 */
   for (int i = 0; i < blocks->size; ++i) {
     BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
     b->in = set_create();
     b->out = set_create();
   }
 
-  // 3. 迭代计算in和out集合
-  int change = 1;
-  while (change) {
-    change = 0;
+  dataflow_solve_backward(0); /* 0 = union confluence */
 
-    // 从后向前遍历基本块
-    for (int i = blocks->size - 1; i >= 0; --i) {
-      BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
-
-      // 保存旧的in集合
-      Set *old_in = set_create();
-      set_inorder_traverse_insert(b->in->root, old_in);
-
-      // 计算out[B] = 所有后继的in的并集
-      Set *out = set_create();
-      for (int j = 0; j < b->successors->size; ++j) {
-        int succ_id = *(int *)vector_get(b->successors, j);
-        BasicBlock *succ_b = find_block_by_id(succ_id);
-        if (succ_b) {
-            Set *temp = set_union(out, succ_b->in);
-            set_free(out);
-            out = temp;
-        }
-      }
-
-      // 更新out集合
-      set_free(b->out);
-      b->out = out;
-
-      // 计算in[B] = use[B] ∪ (out[B] - def[B])
-      // 注意：这里b->gen是use集合，b->kill是def集合
-      Set *out_minus_def = set_difference(b->out, b->kill);
-      Set *new_in = set_union(b->gen, out_minus_def);
-      set_free(out_minus_def);
-
-      // 检查in集合是否发生变化
-      if (!set_equal(new_in, b->in)) {
-        change = 1;
-        set_free(b->in);
-        b->in = new_in;
-      } else {
-        set_free(new_in);
-      }
-
-      set_free(old_in);
-    }
-  }
-
-  // 4. 打印结果
+  /* 打印结果 */
   for (int i = 0; i < blocks->size; ++i) {
     const BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
     fprintf(outFile, "Block %d IN: { ", b->id);
@@ -1049,12 +1091,6 @@ void live_variables() {
     fprintf(outFile, "}\n");
     fprintf(outFile, "Block %d OUT: { ", b->id);
     print_set(outFile, b->out, 10);
-    fprintf(outFile, "}\n");
-    fprintf(outFile, "Block %d USE: { ", b->id);
-    print_set(outFile, b->gen, 5);
-    fprintf(outFile, "}\n");
-    fprintf(outFile, "Block %d DEF: { ", b->id);
-    print_set(outFile, b->kill, 5);
     fprintf(outFile, "}\n");
   }
 }
@@ -1133,86 +1169,27 @@ Set *set_intersection(const Set *s1, const Set *s2) {
   return result;
 }
 
-// 可用表达式分析
+// 可用表达式分析（前向 ∩ 汇合）
 void available_expressions() {
   fprintf(outFile, "\n[分析] 1.3 可用表达式分析...\n");
 
-  // 1. 构建表达式全集与唯一定义映射（用于 AE 初值及后续 CSE）
   build_expression_universe_and_defs();
-
-  // 2. 计算每个基本块的eval和kill集合
   compute_eval_kill_available();
 
-  // 3. 初始化in和out集合：out[Entry]=空，其余out=全集
+  /* 初始化: out[Entry]=空, 其余out=全集 */
   for (int i = 0; i < blocks->size; ++i) {
     BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
     b->in = set_create();
     if (i == 0) {
-      b->out = set_create(); // Entry: 空
+      b->out = set_create();
     } else {
-      b->out = set_clone(g_expr_universe); // 其余：全集
+      b->out = set_clone(g_expr_universe);
     }
   }
 
-  // 3. 迭代计算in和out集合
-  int change = 1;
-  while (change) {
-    change = 0;
+  dataflow_solve_forward(1); /* 1 = intersection confluence */
 
-    for (int i = 0; i < blocks->size; ++i) {
-      BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
-
-      // 保存旧的out集合
-      Set *old_out = set_create();
-      set_inorder_traverse_insert(b->out->root, old_out);
-
-      // 计算in[B] = ∩ (out[P] for P in predecessors[B])
-      Set *in = NULL;
-      for (int j = 0; j < b->predecessors->size; ++j) {
-        int pred_id = *(int *)vector_get(b->predecessors, j);
-
-        BasicBlock *pred_b = find_block_by_id(pred_id);
-
-        if (pred_b != NULL) {
-          if (in == NULL) {
-            in = set_create();
-            set_inorder_traverse_insert(pred_b->out->root, in);
-          } else {
-            Set *temp = set_intersection(in, pred_b->out);
-            set_free(in);
-            in = temp;
-          }
-        }
-      }
-
-      if (in == NULL) {
-        in = set_create();
-      }
-
-      // 更新in集合
-      set_free(b->in);
-      b->in = in;
-
-      // 计算out[B] = eval[B] ∪ (in[B] - kill[B])
-      // 注意：这里b->gen是eval集合，b->kill是kill集合
-      Set *in_minus_kill = set_difference(b->in, b->kill);
-      Set *new_out = set_union(b->gen, in_minus_kill);
-      set_free(in_minus_kill);
-
-      // 检查out集合是否发生变化
-      if (!set_equal(new_out, b->out)) {
-        change = 1;
-        set_free(b->out);
-        b->out = new_out;
-      } else {
-        set_free(new_out);
-      }
-
-      set_free(old_out);
-    }
-  }
-
-  // 4. 打印结果
+  /* 打印结果 */
   for (int i = 0; i < blocks->size; ++i) {
     const BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
     fprintf(outFile, "Block %d IN: { ", b->id);
@@ -1220,12 +1197,6 @@ void available_expressions() {
     fprintf(outFile, "}\n");
     fprintf(outFile, "Block %d OUT: { ", b->id);
     print_set(outFile, b->out, 10);
-    fprintf(outFile, "}\n");
-    fprintf(outFile, "Block %d EVAL: { ", b->id);
-    print_set(outFile, b->gen, 5);
-    fprintf(outFile, "}\n");
-    fprintf(outFile, "Block %d KILL: { ", b->id);
-    print_set(outFile, b->kill, 5);
     fprintf(outFile, "}\n");
   }
 }
@@ -1290,85 +1261,26 @@ void compute_eval_kill_very_busy() {
   }
 }
 
-// 非常忙表达式分析
+// 非常忙表达式分析（后向 ∩ 汇合）
 void very_busy_expressions() {
   fprintf(outFile, "\n[分析] 1.4 预期执行的表达式分析...\n");
 
-  // 1. 计算每个基本块的eval和kill集合
   compute_eval_kill_very_busy();
 
-  // 2. 初始化in和out集合：in[Exit]=空，其余in=全集
-  // Exit 的判断：succ 为空的块
+  /* 初始化: in[Exit]=空, 其余in=全集 */
   for (int i = 0; i < blocks->size; ++i) {
     BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
     b->out = set_create();
     if (b->successors->size == 0) {
-      b->in = set_create(); // Exit: 空
+      b->in = set_create();
     } else {
-      b->in = set_clone(g_expr_universe ? g_expr_universe : set_create()); // 非 Exit: 全集
+      b->in = set_clone(g_expr_universe ? g_expr_universe : set_create());
     }
   }
 
-  // 3. 迭代计算in和out集合
-  int change = 1;
-  while (change) {
-    change = 0;
+  dataflow_solve_backward(1); /* 1 = intersection confluence */
 
-    // 从后向前遍历基本块
-    for (int i = blocks->size - 1; i >= 0; --i) {
-      BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
-
-      // 保存旧的in集合
-      Set *old_in = set_create();
-      set_inorder_traverse_insert(b->in->root, old_in);
-
-      // 计算out[B] = ∩ (in[S] for S in successors[B])
-      Set *out = NULL;
-      for (int j = 0; j < b->successors->size; ++j) {
-        int succ_id = *(int *)vector_get(b->successors, j);
-
-        BasicBlock *succ_b = find_block_by_id(succ_id);
-
-        if (succ_b != NULL) {
-          if (out == NULL) {
-            out = set_create();
-            set_inorder_traverse_insert(succ_b->in->root, out);
-          } else {
-            Set *temp = set_intersection(out, succ_b->in);
-            set_free(out);
-            out = temp;
-          }
-        }
-      }
-
-      if (out == NULL) {
-        out = set_create();
-      }
-
-      // 更新out集合
-      set_free(b->out);
-      b->out = out;
-
-      // 计算in[B] = eval[B] ∪ (out[B] - kill[B])
-      // 注意：这里b->gen是eval集合，b->kill是kill集合
-      Set *out_minus_kill = set_difference(b->out, b->kill);
-      Set *new_in = set_union(b->gen, out_minus_kill);
-      set_free(out_minus_kill);
-
-      // 检查in集合是否发生变化
-      if (!set_equal(new_in, b->in)) {
-        change = 1;
-        set_free(b->in);
-        b->in = new_in;
-      } else {
-        set_free(new_in);
-      }
-
-      set_free(old_in);
-    }
-  }
-
-  // 4. 打印结果
+  /* 打印结果 */
   for (int i = 0; i < blocks->size; ++i) {
     const BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
     fprintf(outFile, "Block %d IN: { ", b->id);
@@ -1376,12 +1288,6 @@ void very_busy_expressions() {
     fprintf(outFile, "}\n");
     fprintf(outFile, "Block %d OUT: { ", b->id);
     print_set(outFile, b->out, 10);
-    fprintf(outFile, "}\n");
-    fprintf(outFile, "Block %d EVAL: { ", b->id);
-    print_set(outFile, b->gen, 5);
-    fprintf(outFile, "}\n");
-    fprintf(outFile, "Block %d KILL: { ", b->id);
-    print_set(outFile, b->kill, 5);
     fprintf(outFile, "}\n");
   }
 }
