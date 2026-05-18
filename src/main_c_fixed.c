@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdint.h>
 #include "optimizer.h"
+#include "bitset.h"
 
 // ==========================================
 // 1. 全局配置
@@ -1461,47 +1462,241 @@ void cross_block_cse() {
 // 6. 循环优化
 // ==========================================
 
-// 查找循环
-Map *find_loops() {
-  Map *loops = map_create();
-  int loop_count = 0;
+// --- 支配树（Cooper-Harvey-Kennedy 算法）---
 
-  for (int i = 0; i < blocks->size; i++) {
-    BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
-    for (int j = 0; j < b->successors->size; j++) {
-      int succ_id = *(int *)vector_get(b->successors, j);
+#define UNDEFINED_IDOM -1
 
-      // 检查是否存在回边 (back edge)：指向前面的块
-      if (succ_id <= b->id) {
-        // 查找循环头：回边指向的块就是循环头
-        int header_id = succ_id;
-        int back_id = b->id;
-
-        // 记录循环信息
-        char loop_header_key[32];
-        char loop_back_key[32];
-        char loop_exists_key[32];
-
-        sprintf(loop_exists_key, "loop_%d_exists", loop_count);
-        if (!map_contains(loops, loop_exists_key)) {
-          sprintf(loop_header_key, "loop_%d_header", loop_count);
-          sprintf(loop_back_key, "loop_%d_back", loop_count);
-
-          map_insert(loops, loop_header_key, (void *)(intptr_t)header_id);
-          map_insert(loops, loop_back_key, (void *)(intptr_t)back_id);
-          map_insert(loops, loop_exists_key, (void *)(intptr_t)1);
-
-          fprintf(outFile, "检测到循环 %d: Header=%d Back=%d\n", loop_count,
-                  header_id, back_id);
-          loop_count++;
-        }
+/* DFS 后序遍历 CFG，结果存入 postorder 数组 */
+static void postorder_dfs(int bb_id, int *visited, int *postorder, int *po_idx) {
+  visited[bb_id] = 1;
+  BasicBlock *bb = find_block_by_id(bb_id + 1); /* bb_id 是 0-based */
+  if (bb) {
+    for (int i = 0; i < bb->successors->size; i++) {
+      int succ = *(int *)vector_get(bb->successors, i);
+      int succ_idx = succ - 1; /* 转换为 0-based */
+      if (!visited[succ_idx]) {
+        postorder_dfs(succ_idx, visited, postorder, po_idx);
       }
     }
   }
+  postorder[(*po_idx)++] = bb_id;
+}
 
-  // 记录找到的循环数量
-  map_insert(loops, "loop_count", (void *)(intptr_t)loop_count);
+/* 计算后序编号映射：postorder_map[bb] = 该结点在后序中的位置 */
+static void compute_postorder_map(const int *postorder, int n, int *po_map) {
+  for (int i = 0; i < n; i++) {
+    po_map[postorder[i]] = i;
+  }
+}
+
+/* intersect: 沿 idom 链向上找到 b1 和 b2 的最近公共支配者 */
+static int intersect(int b1, int b2, const int *idoms, const int *po_map) {
+  while (b1 != b2) {
+    if (po_map[b1] < po_map[b2]) {
+      b1 = idoms[b1];
+    } else {
+      b2 = idoms[b2];
+    }
+  }
+  return b1;
+}
+
+/* 构建支配树：计算每个基本块的立即支配者（idom） */
+static int *compute_dominators(int n_blocks) {
+  /* 分配并初始化 */
+  int *visited = (int *)calloc(n_blocks, sizeof(int));
+  int *postorder = (int *)calloc(n_blocks, sizeof(int));
+  int *po_map = (int *)calloc(n_blocks, sizeof(int));
+  int *idoms = (int *)malloc(n_blocks * sizeof(int));
+  int po_idx = 0;
+
+  /* 从入口块（block 1, 0-based index 0）开始 DFS */
+  postorder_dfs(0, visited, postorder, &po_idx);
+
+  /* 验证后序遍历覆盖了所有可达结点 */
+  assert(po_idx == n_blocks && "CFG 中存在不可达的基本块");
+
+  compute_postorder_map(postorder, n_blocks, po_map);
+
+  /* 初始化：入口块的 idom 是自身，其余为 UNDEFINED */
+  for (int i = 0; i < n_blocks; i++) {
+    idoms[i] = UNDEFINED_IDOM;
+  }
+  idoms[0] = 0; /* 入口块支配自身 */
+
+  /* 不动点迭代 */
+  int change;
+  do {
+    change = 0;
+    /* 逆后序遍历（排除入口块，即最后一个后序结点） */
+    for (int i = n_blocks - 2; i >= 0; i--) {
+      int bb = postorder[i];
+      BasicBlock *b = find_block_by_id(bb + 1);
+      if (!b || b->predecessors->size == 0) continue;
+
+      /* new_idom = 第一个有已计算 idom 的前驱 */
+      int new_idom = -1;
+      for (int j = 0; j < b->predecessors->size; j++) {
+        int pred = *(int *)vector_get(b->predecessors, j);
+        int pred_idx = pred - 1;
+        if (idoms[pred_idx] != UNDEFINED_IDOM) {
+          new_idom = pred_idx;
+          break;
+        }
+      }
+
+      /* 与其他前驱交运算 */
+      if (new_idom >= 0) {
+        for (int j = 0; j < b->predecessors->size; j++) {
+          int pred = *(int *)vector_get(b->predecessors, j);
+          int pred_idx = pred - 1;
+          if (pred_idx != new_idom && idoms[pred_idx] != UNDEFINED_IDOM) {
+            new_idom = intersect(new_idom, pred_idx, idoms, po_map);
+          }
+        }
+      }
+
+      if (new_idom >= 0 && idoms[bb] != new_idom) {
+        idoms[bb] = new_idom;
+        change = 1;
+      }
+    }
+  } while (change);
+
+  free(visited);
+  free(postorder);
+  free(po_map);
+  return idoms;
+}
+
+/* 查询 a 是否支配 b（a 和 b 均为 0-based 索引） */
+static int dominates(int a, int b, const int *idoms) {
+  if (a == 0) return 1; /* 入口块支配所有 */
+  int runner = idoms[b];
+  while (runner != 0) {
+    if (runner == a) return 1;
+    runner = idoms[runner];
+  }
+  return 0;
+}
+
+/* 自然循环结构 */
+typedef struct {
+  int header;       /* 循环头块 ID */
+  int latch;        /* 回边源块 ID */
+  int *bbs;         /* 循环体内的块 ID 数组（0-based） */
+  int bbs_count;    /* 循环体内块数 */
+} NaturalLoop;
+
+/* 基于支配树检测自然循环：回边 n→h 满足 h dominates n */
+/* 循环体 = {h} ∪ {能到达 n 但不经过 h 的所有结点} */
+static NaturalLoop *detect_natural_loops(int *idoms, int n_blocks, int *loop_count) {
+  NaturalLoop *loops = NULL;
+  int capacity = 0;
+  *loop_count = 0;
+
+  for (int n = 0; n < n_blocks; n++) {
+    BasicBlock *b = find_block_by_id(n + 1);
+    if (!b) continue;
+    for (int s = 0; s < b->successors->size; s++) {
+      int h = *(int *)vector_get(b->successors, s);
+      int h_idx = h - 1;
+
+      /* 回边：h dominates n */
+      if (dominates(h_idx, n, idoms)) {
+        /* 收集循环体：从 n 反向 BFS，不经过 h */
+        int *in_loop = (int *)calloc(n_blocks, sizeof(int));
+        int *queue = (int *)malloc(n_blocks * sizeof(int));
+        int qh = 0, qt = 0;
+
+        in_loop[h_idx] = 1; /* header 在循环中 */
+        if (!in_loop[n]) {
+          in_loop[n] = 1;
+          queue[qt++] = n;
+        }
+
+        while (qh < qt) {
+          int cur = queue[qh++];
+          BasicBlock *cur_bb = find_block_by_id(cur + 1);
+          if (!cur_bb) continue;
+          for (int p = 0; p < cur_bb->predecessors->size; p++) {
+            int pred = *(int *)vector_get(cur_bb->predecessors, p);
+            int pred_idx = pred - 1;
+            if (!in_loop[pred_idx]) {
+              in_loop[pred_idx] = 1;
+              queue[qt++] = pred_idx;
+            }
+          }
+        }
+
+        /* 压缩到数组 */
+        int count = 0;
+        for (int i = 0; i < n_blocks; i++) {
+          if (in_loop[i]) count++;
+        }
+
+        /* 扩容并添加 */
+        if (*loop_count >= capacity) {
+          capacity = capacity == 0 ? 4 : capacity * 2;
+          loops = (NaturalLoop *)realloc(loops, capacity * sizeof(NaturalLoop));
+        }
+
+        loops[*loop_count].header = h;
+        loops[*loop_count].latch = n + 1;
+        loops[*loop_count].bbs = (int *)malloc(count * sizeof(int));
+        loops[*loop_count].bbs_count = count;
+        int idx = 0;
+        for (int i = 0; i < n_blocks; i++) {
+          if (in_loop[i]) loops[*loop_count].bbs[idx++] = i + 1; /* 转回 1-based */
+        }
+        (*loop_count)++;
+
+        free(in_loop);
+        free(queue);
+      }
+    }
+  }
   return loops;
+}
+
+static void free_natural_loops(NaturalLoop *loops, int count) {
+  for (int i = 0; i < count; i++) free(loops[i].bbs);
+  free(loops);
+}
+
+/* 基于支配树查找循环，返回兼容旧接口的 Map */
+static Map *find_loops_with_dominators(int n_blocks) {
+  Map *loops = map_create();
+  int loop_count = 0;
+
+  int *idoms = compute_dominators(n_blocks);
+  int nat_count = 0;
+  NaturalLoop *nat_loops = detect_natural_loops(idoms, n_blocks, &nat_count);
+
+  for (int li = 0; li < nat_count; li++) {
+    char loop_header_key[32], loop_back_key[32], loop_exists_key[32];
+    sprintf(loop_exists_key, "loop_%d_exists", loop_count);
+    sprintf(loop_header_key, "loop_%d_header", loop_count);
+    sprintf(loop_back_key, "loop_%d_back", loop_count);
+
+    map_insert(loops, loop_header_key, (void *)(intptr_t)nat_loops[li].header);
+    map_insert(loops, loop_back_key, (void *)(intptr_t)nat_loops[li].latch);
+    map_insert(loops, loop_exists_key, (void *)(intptr_t)1);
+
+    fprintf(outFile, "检测到循环 %d: Header=%d Back=%d (支配树检测, 体=%d块)\n",
+            loop_count, nat_loops[li].header, nat_loops[li].latch, nat_loops[li].bbs_count);
+    loop_count++;
+  }
+
+  map_insert(loops, "loop_count", (void *)(intptr_t)loop_count);
+  free_natural_loops(nat_loops, nat_count);
+  free(idoms);
+  return loops;
+}
+
+// 查找循环（新接口：使用支配树）
+Map *find_loops() {
+  return find_loops_with_dominators(blocks->size);
 }
 
 // 辅助函数：检查变量在循环内是否为不变量
