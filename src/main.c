@@ -62,7 +62,6 @@ int main(int argc, char *argv[]) {
 
   // 常量传播与折叠（在循环优化之前，以简化循环条件）
   constant_propagation();
-  dead_block_elimination();     // 删除常量折叠后产生的不可达块
 
   // 执行循环优化
   optimize_invariant_code_motion();      // 循环不变量外提
@@ -73,7 +72,7 @@ int main(int argc, char *argv[]) {
   // 执行其他全局优化
   simplify_instructions();      // 合并冗余的临时变量赋值
   eliminate_dead_code();        // 删除死代码
-  /* dead_block_elimination 待修复后启用 */
+  dead_block_elimination();     // 删除不可达基本块
 
   // --- 5. 清理与输出 ---
 

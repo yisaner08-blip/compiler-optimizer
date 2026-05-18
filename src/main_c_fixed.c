@@ -1797,6 +1797,12 @@ static int is_var_invariant(const char *var, int loop_header, int loop_back, Map
           invariant = 0;
           break;
         }
+        /* 数组写 =[] 的 arg1 也是定值（规范化后 value 存在 arg1） */
+        if (str_equal(string_cstr(other_q->op), "=[]") &&
+            str_equal(string_cstr(other_q->arg1), var)) {
+          invariant = 0;
+          break;
+        }
       }
       if (!invariant) break;
     }
@@ -1873,8 +1879,20 @@ void optimize_invariant_code_motion() {
   Map *loops = find_loops();
   int loop_count = (int)(intptr_t)map_get(loops, "loop_count", (void *)0);
 
-  // 遍历所有检测到的循环
+  // 找到最外层循环（最小header），只对最外层做LICM
+  int outer_header = 999999, outer_back = 0, outer_idx = -1;
   for (int loop_idx = 0; loop_idx < loop_count; loop_idx++) {
+    char lhk[32], lbk[32];
+    sprintf(lhk, "loop_%d_header", loop_idx);
+    sprintf(lbk, "loop_%d_back", loop_idx);
+    int h = (int)(intptr_t)map_get(loops, lhk, (void *)-1);
+    int b = (int)(intptr_t)map_get(loops, lbk, (void *)-1);
+    if (h < outer_header) { outer_header = h; outer_back = b; outer_idx = loop_idx; }
+  }
+
+  // 仅处理最外层循环
+  for (int loop_idx = 0; loop_idx < loop_count; loop_idx++) {
+    if (loop_idx != outer_idx) continue; /* 跳过内层循环 */
     char loop_header_key[32];
     char loop_back_key[32];
     sprintf(loop_header_key, "loop_%d_header", loop_idx);
@@ -2412,7 +2430,7 @@ void optimize_induction_variable_elimination() {
           int var_stride = atoi(string_cstr(q->arg2));
           int var_init = get_initial_value(var, header);
           // 检查：相同初始值，步长成整数比例
-          if (var_init == iv_init && var_stride % iv_stride == 0 && var_stride / iv_stride > 0) {
+          if (var_init == iv_init && var_stride % iv_stride == 0 && var_stride / iv_stride > 1) {
             derived_iv = var;
             factor_val = var_stride / iv_stride;
             fprintf(outFile, "  [IVE] 导出归纳变量(步长比): %s (步长%d/%d=%d)\n",
