@@ -62,6 +62,7 @@ int main(int argc, char *argv[]) {
 
   // 常量传播与折叠（在循环优化之前，以简化循环条件）
   constant_propagation();
+  dead_block_elimination();     // 删除常量折叠后产生的不可达块
 
   // 执行循环优化
   optimize_invariant_code_motion();      // 循环不变量外提

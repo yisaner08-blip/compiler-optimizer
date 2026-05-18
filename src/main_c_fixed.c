@@ -2858,7 +2858,15 @@ void dead_block_elimination() {
   int n = blocks->size;
   if (n == 0) return;
 
-  /* 从入口块(0)做DFS，标记可达块 */
+  /* 找到 block id 对应的向量索引 */
+  int *id_to_idx = (int *)malloc((n + 2) * sizeof(int));
+  for (int i = 0; i <= n + 1; ++i) id_to_idx[i] = -1;
+  for (int i = 0; i < n; ++i) {
+    BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
+    if (b) id_to_idx[b->id] = i;
+  }
+
+  /* 从入口块(0)做DFS */
   int *reachable = (int *)calloc(n, sizeof(int));
   int *stack = (int *)malloc(n * sizeof(int));
   int sp = 0;
@@ -2870,49 +2878,41 @@ void dead_block_elimination() {
     BasicBlock *b = (BasicBlock *)vector_get(blocks, cur);
     if (!b) continue;
 
-    /* 通过非删除的分支指令找后继 */
+    /* 通过 goto/if 找显式分支目标 */
+    int has_uncond = 0;
     for (int j = 0; j < b->instructions->size; ++j) {
       Quad *q = (Quad *)vector_get(b->instructions, j);
       if (q->removed) continue;
       const char *op = string_cstr(q->op);
+      if (str_equal(op, "goto")) { has_uncond = 1; }
+      if (str_equal(op, "ret"))  { has_uncond = 1; }
       if (str_equal(op, "goto") || str_equal(op, "if")) {
-        const char *target = string_cstr(q->result);
-        if (target[0] != '\0' && !str_equal(target, "null") &&
-            map_contains(labelToBlockId, target)) {
-          int tid = (int)(intptr_t)map_get(labelToBlockId, target, (void*)-1);
-          /* 找到目标块在 blocks 中的索引 */
-          for (int k = 0; k < n; ++k) {
-            BasicBlock *bk = (BasicBlock *)vector_get(blocks, k);
-            if (bk && bk->id == tid && !reachable[k]) {
-              reachable[k] = 1;
-              stack[sp++] = k;
-              break;
-            }
+        const char *tgt = string_cstr(q->result);
+        if (tgt[0] && !str_equal(tgt, "null") && map_contains(labelToBlockId, tgt)) {
+          int tid = (int)(intptr_t)map_get(labelToBlockId, tgt, (void*)-1);
+          int t_idx = (tid <= n + 1) ? id_to_idx[tid] : -1;
+          if (t_idx >= 0 && !reachable[t_idx]) {
+            reachable[t_idx] = 1;
+            stack[sp++] = t_idx;
           }
         }
       }
     }
 
-    /* fallthrough 到下一块（除非最后一条是 goto/ret） */
-    Quad *lastQ = NULL;
-    for (int j = b->instructions->size - 1; j >= 0; --j) {
-      Quad *q = (Quad *)vector_get(b->instructions, j);
-      if (!q->removed) { lastQ = q; break; }
-    }
-    int has_uncond_jump = 0;
-    if (lastQ) {
-      const char *lop = string_cstr(lastQ->op);
-      if (str_equal(lop, "goto") || str_equal(lop, "ret")) has_uncond_jump = 1;
-    }
-    if (!has_uncond_jump && cur + 1 < n && !reachable[cur + 1]) {
-      reachable[cur + 1] = 1;
-      stack[sp++] = cur + 1;
+    /* fallthrough: 下一个 ID 的块 */
+    if (!has_uncond) {
+      int next_id = b->id + 1;
+      int ft_idx = (next_id <= n + 1) ? id_to_idx[next_id] : -1;
+      if (ft_idx >= 0 && !reachable[ft_idx]) {
+        reachable[ft_idx] = 1;
+        stack[sp++] = ft_idx;
+      }
     }
   }
 
-  /* 删除不可达块中的所有指令 */
+  /* 删除不可达块 */
   int dead_blocks = 0, dead_instrs = 0;
-  for (int i = 1; i < n; ++i) { /* 跳过入口块 */
+  for (int i = 1; i < n; ++i) {
     if (!reachable[i]) {
       BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
       if (!b) continue;
@@ -2921,13 +2921,14 @@ void dead_block_elimination() {
         Quad *q = (Quad *)vector_get(b->instructions, j);
         if (!q->removed) { q->removed = 1; dead_instrs++; }
       }
-      fprintf(outFile, "  [DeadBlock] 删除不可达块 %d\n", b->id);
+      fprintf(outFile, "  [DeadBlock] 删除不可达块 %d (%d条指令)\n", b->id, b->instructions->size);
     }
   }
 
   fprintf(outFile, "  [DeadBlock] 删除 %d 个死块, %d 条指令\n", dead_blocks, dead_instrs);
   free(reachable);
   free(stack);
+  free(id_to_idx);
 }
 
 // 将所有preHeader指令移到第一个基本块
