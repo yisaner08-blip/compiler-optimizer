@@ -34,6 +34,10 @@ static BitSet bitset_create(uint32_t max_elems) {
   bs.max_elems = max_elems;
   uint32_t nwords = bitset_num_words(max_elems);
   bs.data = (BitSetWord *)calloc(nwords, sizeof(BitSetWord));
+  if (!bs.data) {
+    /* 分配失败时返回空数据位集，max_elems 置 0 标记无效 */
+    bs.max_elems = 0;
+  }
   return bs;
 }
 

@@ -4,7 +4,15 @@
 #include <string.h>
 #include <stdint.h>
 #include "optimizer.h"
+/* bitset.h 作为基础设施库预留，暂未使用其接口 */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#endif
 #include "bitset.h"
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 // ==========================================
 // 1. 全局配置
@@ -46,7 +54,12 @@ void string_append(MyString *s, const char *str) {
   int len = strlen(str);
   while (s->length + len + 1 > s->capacity) {
     s->capacity *= 2;
-    s->data = (char *)realloc(s->data, s->capacity * sizeof(char));
+    char *new_data = (char *)realloc(s->data, s->capacity * sizeof(char));
+    if (!new_data) {
+      fprintf(stderr, "内存分配失败: string_append realloc\n");
+      return;
+    }
+    s->data = new_data;
   }
   strcat(s->data, str);
   s->length += len;
@@ -105,7 +118,12 @@ void *vector_get(const Vector *v, int index) {
 void vector_push_back(Vector *v, void *item) {
   if (v->size == v->capacity) {
     v->capacity *= 2;
-    v->data = (void **)realloc(v->data, v->capacity * sizeof(void *));
+    void **new_data = (void **)realloc(v->data, v->capacity * sizeof(void *));
+    if (!new_data) {
+      fprintf(stderr, "内存分配失败: vector_push_back realloc\n");
+      return;
+    }
+    v->data = new_data;
   }
   v->data[v->size++] = item;
 }
@@ -117,7 +135,12 @@ void vector_insert(Vector *v, int index, void *item) {
   }
   if (v->size == v->capacity) {
     v->capacity *= 2;
-    v->data = (void **)realloc(v->data, v->capacity * sizeof(void *));
+    void **new_data = (void **)realloc(v->data, v->capacity * sizeof(void *));
+    if (!new_data) {
+      fprintf(stderr, "内存分配失败: vector_insert realloc\n");
+      return;
+    }
+    v->data = new_data;
   }
   for (int i = v->size; i > index; i--) {
     v->data[i] = v->data[i - 1];
@@ -758,57 +781,74 @@ void print_set(FILE *file, const Set *s, int max_items) {
   }
 }
 
-// 计算基本块的gen和kill集合
+// 计算基本块的gen和kill集合（参照标准数据流分析算法实现）
+// 注：gen[B]=块内所有定值；kill[B]=所有其他指令对同变量的定值（含同块内）
 void compute_gen_kill() {
+  // 1. 预计算：变量名 -> 该变量所有定值字符串的集合
+  Map *var_to_defs = map_create();
+
   for (int i = 0; i < blocks->size; ++i) {
     BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
+    for (int j = 0; j < b->instructions->size; ++j) {
+      Quad *q = (Quad *)vector_get(b->instructions, j);
+      if (q->removed) continue;
+      const char *result = string_cstr(q->result);
+      if (!str_equal(result, "null") && !is_constant(result)) {
+        char def_str[64];
+        sprintf(def_str, "%d:%s", q->id, result);
+        Set *defs = (Set *)map_get(var_to_defs, result, NULL);
+        if (!defs) {
+          defs = set_create();
+          map_insert(var_to_defs, result, defs);
+        }
+        set_insert(defs, def_str);
+      }
+    }
+  }
 
-    // 初始化gen和kill集合
+  // 2. 使用预计算映射计算 gen/kill（语义与原算法完全一致）
+  for (int i = 0; i < blocks->size; ++i) {
+    BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
     b->gen = set_create();
     b->kill = set_create();
 
-    // 遍历基本块中的每条指令
     for (int j = 0; j < b->instructions->size; ++j) {
       Quad *q = (Quad *)vector_get(b->instructions, j);
-      if (q->removed) {
-        continue;
-      }
+      if (q->removed) continue;
 
-      // 获取当前指令的结果变量
       const char *result = string_cstr(q->result);
       if (!str_equal(result, "null") && !is_constant(result)) {
-        // 生成定值字符串：id:var
         char def_str[64];
         sprintf(def_str, "%d:%s", q->id, result);
-
-        // 添加到gen集合
         set_insert(b->gen, def_str);
 
-        // 遍历所有指令，查找是否有其他指令定值了相同的变量
-        for (int k = 0; k < blocks->size; ++k) {
-          BasicBlock *other_b = (BasicBlock *)vector_get(blocks, k);
-          for (int l = 0; l < other_b->instructions->size; ++l) {
-            Quad *other_q = (Quad *)vector_get(other_b->instructions, l);
-            if (other_q->removed) {
-              continue;
-            }
-
-            const char *other_result = string_cstr(other_q->result);
-            if (!str_equal(other_result, "null") &&
-                !is_constant(other_result) && str_equal(other_result, result) &&
-                (other_b->id != b->id || other_q->id != q->id)) {
-              // 生成其他定值字符串
-              char other_def_str[64];
-              sprintf(other_def_str, "%d:%s", other_q->id, other_result);
-
-              // 添加到kill集合
-              set_insert(b->kill, other_def_str);
-            }
-          }
+        // 将该变量所有定值加入 kill（包括同块内的其他定值）
+        Set *all_defs = (Set *)map_get(var_to_defs, result, NULL);
+        if (all_defs) {
+          set_inorder_traverse_insert(all_defs->root, b->kill);
         }
       }
     }
   }
+
+  // 3. 释放预计算映射
+  Set *freed_vars = set_create();
+  for (int i = 0; i < blocks->size; ++i) {
+    BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
+    for (int j = 0; j < b->instructions->size; ++j) {
+      Quad *q = (Quad *)vector_get(b->instructions, j);
+      if (q->removed) continue;
+      const char *result = string_cstr(q->result);
+      if (!str_equal(result, "null") && !is_constant(result) &&
+          !set_contains(freed_vars, result)) {
+        set_insert(freed_vars, result);
+        Set *defs = (Set *)map_get(var_to_defs, result, NULL);
+        if (defs) set_free(defs);
+      }
+    }
+  }
+  set_free(freed_vars);
+  map_free(var_to_defs);
 }
 
 // 合并多个Set的并集
@@ -1454,7 +1494,7 @@ void constant_propagation() {
 
         /* 记录常量（仅入口块，且变量在后继块中无重定义） */
         if (str_equal(op, "=") && is_constant(a1) && is_variable(result)) {
-          if (!map_contains(const_map, result) && b->id <= 2) {
+          if (!map_contains(const_map, result) && i == 0) {
             /* 检查此变量在后续块中是否被重新定义 */
             int has_later_def = 0;
             for (int bi = 0; bi < blocks->size && !has_later_def; ++bi) {
@@ -1479,7 +1519,7 @@ void constant_propagation() {
 
         /* 记录复制关系 */
         if (str_equal(op, "=") && is_variable(a1) && !is_constant(a1) &&
-            is_variable(result) && b->id <= 2) {
+            is_variable(result) && i == 0) {
           if (!map_contains(copy_map, result) && !map_contains(const_map, result)) {
             const char *src = resolve_copy_chain(a1, copy_map, 0);
             map_insert(copy_map, result, (void*)src);
@@ -1880,14 +1920,12 @@ void optimize_invariant_code_motion() {
   int loop_count = (int)(intptr_t)map_get(loops, "loop_count", (void *)0);
 
   // 找到最外层循环（最小header），只对最外层做LICM
-  int outer_header = 999999, outer_back = 0, outer_idx = -1;
+  int outer_header = 999999, outer_idx = -1;
   for (int loop_idx = 0; loop_idx < loop_count; loop_idx++) {
-    char lhk[32], lbk[32];
+    char lhk[32];
     sprintf(lhk, "loop_%d_header", loop_idx);
-    sprintf(lbk, "loop_%d_back", loop_idx);
     int h = (int)(intptr_t)map_get(loops, lhk, (void *)-1);
-    int b = (int)(intptr_t)map_get(loops, lbk, (void *)-1);
-    if (h < outer_header) { outer_header = h; outer_back = b; outer_idx = loop_idx; }
+    if (h < outer_header) { outer_header = h; outer_idx = loop_idx; }
   }
 
   // 仅处理最外层循环
