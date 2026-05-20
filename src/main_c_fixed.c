@@ -1,18 +1,11 @@
-﻿#include <ctype.h>
+﻿#include <assert.h>
+#include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include "optimizer.h"
-/* bitset.h 作为基础设施库预留，暂未使用其接口 */
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-function"
-#endif
-#include "bitset.h"
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
 
 // ==========================================
 // 1. 全局配置
@@ -457,200 +450,15 @@ static BasicBlock *find_block_by_id(int id) {
   return NULL;
 }
 
-// 根据块指针查找其在 blocks 向量中的索引
-static int find_block_index(const BasicBlock* blk) {
-  for (int i = 0; i < blocks->size; ++i) {
-    if ((BasicBlock*)vector_get(blocks, i) == blk) return i;
-  }
-  return -1;
-}
 
-// 在块内找到第一个 label 名称
-static const char* get_block_label(BasicBlock* b) {
-  for (int j = 0; j < b->instructions->size; ++j) {
-    Quad *q = (Quad *)vector_get(b->instructions, j);
-    if (str_equal(string_cstr(q->op), "label")) {
-      return string_cstr(q->result);
-    }
-  }
-  return NULL;
-}
 
-// 创建一个新的 label 指令四元式
-static Quad* make_label_quad(const char* name) {
-  Quad* q = quad_create();
-  string_append(q->op, "label");
-  string_append(q->arg1, "null");
-  string_append(q->arg2, "null");
-  string_append(q->arg3, "null");
-  string_append(q->result, name);
-  return q;
-}
 
-// 重新构建 labelToBlockId、pred/succ，并重编号 block.id
-void rebuild_cfg() {
-  // 清空旧映射
-  map_free(labelToBlockId);
-  labelToBlockId = map_create();
 
-  // 重编号并清空 pred/succ
-  for (int i = 0; i < blocks->size; ++i) {
-    BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
-    b->id = i + 1;
-    // 清理旧的 pred/succ
-    vector_free(b->predecessors, free);
-    vector_free(b->successors, free);
-    b->predecessors = vector_create();
-    b->successors = vector_create();
-  }
 
-  // 建 label 映射
-  for (int i = 0; i < blocks->size; ++i) {
-    BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
-    for (int j = 0; j < b->instructions->size; ++j) {
-      Quad *q = (Quad *)vector_get(b->instructions, j);
-      if (str_equal(string_cstr(q->op), "label")) {
-        map_insert(labelToBlockId, string_cstr(q->result), (void*)(intptr_t)b->id);
-      }
-    }
-  }
 
-  // 按 load_file 的逻辑重建 CFG
-  for (int i = 0; i < blocks->size; ++i) {
-    BasicBlock *block = (BasicBlock *)vector_get(blocks, i);
-    if (block->instructions->size == 0) continue;
-    Quad *lastQ = (Quad *)vector_get(block->instructions, block->instructions->size - 1);
 
-    if (!str_equal(string_cstr(lastQ->op), "goto") &&
-        !str_equal(string_cstr(lastQ->op), "ret") && i < blocks->size - 1) {
-      BasicBlock *nextBlock = (BasicBlock *)vector_get(blocks, i + 1);
-      int *succ = (int *)malloc(sizeof(int)); *succ = nextBlock->id; vector_push_back(block->successors, succ);
-      int *pred = (int *)malloc(sizeof(int)); *pred = block->id; vector_push_back(nextBlock->predecessors, pred);
-    }
 
-    const char *target = "";
-    if (str_equal(string_cstr(lastQ->op), "goto") || str_equal(string_cstr(lastQ->op), "if")) {
-      target = string_cstr(lastQ->result);
-    }
-    if (target[0] != '\0' && !str_equal(target, "null") && map_contains(labelToBlockId, target)) {
-      int tid = (int)(intptr_t)map_get(labelToBlockId, target, (void*)-1);
-      int *succ = (int *)malloc(sizeof(int)); *succ = tid; vector_push_back(block->successors, succ);
-      for (int j = 0; j < blocks->size; ++j) {
-        BasicBlock *b = (BasicBlock *)vector_get(blocks, j);
-        if (b->id == tid) { int *pred = (int *)malloc(sizeof(int)); *pred = block->id; vector_push_back(b->predecessors, pred); break; }
-      }
-    }
-  }
-}
 
-// 创建或获取"真正的一次性" preheader：插在 header 之前，并仅由循环外的前驱跳转到该 preheader，
-// preheader 再顺序落到 header。来自循环内部的回边仍然跳到 header，不会触发 preheader。
-BasicBlock* get_or_create_preheader_for_header(int header_id, int back_id) {
-  BasicBlock *header = find_block_by_id(header_id);
-  if (!header) return NULL;
-
-  // 记录循环内部块的指针集合（在结构改动前获取）
-  Vector *internal_blocks = vector_create();
-  for (int i = 0; i < blocks->size; ++i) {
-    BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
-    if (b->id >= header_id && b->id <= back_id) {
-      vector_push_back(internal_blocks, b);
-    }
-  }
-
-  // 获取/创建 header 的标签名；若当前 header 本身是 PREHDR_/PRE_ 块，则将 header 滚动到其后的真实头块
-  const char *header_label = get_block_label(header);
-  if (!header_label) {
-    char auto_label[32]; sprintf(auto_label, "Lh%d", header_id);
-    Quad *lbl = make_label_quad(auto_label);
-    vector_insert(header->instructions, 0, lbl);
-    header_label = string_cstr(lbl->result);
-  }
-  // 若 header_label 带有 PREHDR_/PRE_ 前缀，则将 header 指向下一个块，直到拿到真实头块的标签
-  while (strncmp(header_label, "PREHDR_", 7) == 0 || strncmp(header_label, "PRE_", 4) == 0) {
-    int hidx_tmp = find_block_index(header);
-    if (hidx_tmp >= 0 && hidx_tmp + 1 < blocks->size) {
-      header = (BasicBlock *)vector_get(blocks, hidx_tmp + 1);
-      header_label = get_block_label(header);
-      if (!header_label) {
-        char auto_label2[32]; sprintf(auto_label2, "Lh%d_real", header->id);
-        Quad *lbl2 = make_label_quad(auto_label2);
-        vector_insert(header->instructions, 0, lbl2);
-        header_label = string_cstr(lbl2->result);
-      }
-    } else {
-      break;
-    }
-  }
-
-  // 规范化 preheader 名称：PREHDR_<base>
-  const char *base = header_label;
-  if (strncmp(base, "PREHDR_", 7) == 0) base += 7;
-  if (strncmp(base, "PRE_", 4) == 0) base += 4;
-  char pre_label[300];
-  snprintf(pre_label, sizeof(pre_label), "PREHDR_%s", base);
-
-  // 若已存在，直接返回
-  if (map_contains(labelToBlockId, pre_label)) {
-    int pre_id = (int)(intptr_t)map_get(labelToBlockId, pre_label, (void*)-1);
-    return find_block_by_id(pre_id);
-  }
-
-  // 在 header 之前插入 preheader
-  BasicBlock *pre = basic_block_create();
-  Quad *pre_lbl = make_label_quad(pre_label);
-  vector_push_back(pre->instructions, pre_lbl);
-  int hidx = find_block_index(header);
-  if (hidx < 0) return NULL;
-  vector_insert(blocks, hidx, pre);
-
-  // 重定向：将所有"来自循环外"的显式跳转（goto/if）目标为 header_label 的边改为 preheader
-  for (int i = 0; i < blocks->size; ++i) {
-    BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
-    if (b->id >= header_id && b->id <= back_id) continue; // 跳过循环内部块
-    for (int j = 0; j < b->instructions->size; ++j) {
-      Quad *q = (Quad *)vector_get(b->instructions, j);
-      if (str_equal(string_cstr(q->op), "goto") || str_equal(string_cstr(q->op), "if")) {
-        if (!str_equal(string_cstr(q->result), "null") &&
-            strcmp(string_cstr(q->result), header_label) == 0) {
-          string_clear(q->result); string_append(q->result, pre_label);
-        }
-      }
-    }
-  }
-
-  // 不修改 header.if 的真分支（仍然指向原来的循环体 body），preheader 只会被"来自循环外"的路径触发一次；
-  // fallthrough 外部前驱（非显式分支）也会因为我们把 pre 插在 header 之前而自然落到 pre，再到 header。
-
-  rebuild_cfg();
-
-  // 追加：确保循环内部的回边不指向 preheader，而是指向 header
-  const char *hdr_label2 = get_block_label(header);
-  // 仅修正循环"内部块"的分支目标，避免修改来自循环外的进入边
-  for (int i = 0; i < blocks->size; ++i) {
-    BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
-    if (!b || b == pre) continue;
-    int is_internal = 0;
-    for (int t = 0; t < internal_blocks->size; ++t) {
-      if (vector_get(internal_blocks, t) == b) { is_internal = 1; break; }
-    }
-    if (!is_internal) continue;
-
-    for (int j = 0; j < b->instructions->size; ++j) {
-      Quad *q = (Quad *)vector_get(b->instructions, j);
-      if (str_equal(string_cstr(q->op), "goto") || str_equal(string_cstr(q->op), "if")) {
-        const char *tgt = string_cstr(q->result);
-        if (!str_equal(tgt, "null") && strcmp(tgt, pre_label) == 0) {
-          string_clear(q->result);
-          string_append(q->result, hdr_label2);
-        }
-      }
-    }
-  }
-
-  vector_free(internal_blocks, NULL);
-  return pre;
-}
 
 // ==========================================
 // 5. 数据流分析
@@ -732,9 +540,17 @@ void free_global_vars() {
   map_free(labelToBlockId);
 }
 
-// 检查是否为常量
+// 检查是否为常量（验证整个字符串均为合法数字）
 int is_constant(const char *str) {
-  return isdigit(str[0]) || (str[0] == '-' && isdigit(str[1]));
+  if (!str || !*str) return 0;
+  const char *p = str;
+  if (*p == '-') p++;
+  if (!*p || !isdigit(*p)) return 0;
+  while (*p) {
+    if (!isdigit(*p)) return 0;
+    p++;
+  }
+  return 1;
 }
 
 // 检查是否为变量
@@ -1383,30 +1199,35 @@ void cross_block_cse() {
 // 5.5 常量传播与折叠 + 无用分支删除
 // ==========================================
 
-/* 尝试计算常量表达式的结果，成功返回1 */
+/* 尝试计算常量表达式的结果，使用 int64_t 避免溢出，成功返回1 */
 static int try_const_fold(const char *op, const char *a1, const char *a2, int *result) {
   if (!is_constant(a1)) return 0;
-  int v1 = atoi(a1);
+  int64_t v1 = atoll(a1);
 
   if (str_equal(op, "=")) {
-    *result = v1;
+    *result = (int)v1;
     return 1;
   }
 
   if (!is_constant(a2)) return 0;
-  int v2 = atoi(a2);
+  int64_t v2 = atoll(a2);
+  int64_t r;
 
-  if (str_equal(op, "+"))  { *result = v1 + v2; return 1; }
-  if (str_equal(op, "-"))  { *result = v1 - v2; return 1; }
-  if (str_equal(op, "*"))  { *result = v1 * v2; return 1; }
-  if (str_equal(op, "/"))  { if (v2 == 0) return 0; *result = v1 / v2; return 1; }
-  if (str_equal(op, "<"))  { *result = (v1 < v2);  return 1; }
-  if (str_equal(op, ">"))  { *result = (v1 > v2);  return 1; }
-  if (str_equal(op, "<=")) { *result = (v1 <= v2); return 1; }
-  if (str_equal(op, ">=")) { *result = (v1 >= v2); return 1; }
-  if (str_equal(op, "==")) { *result = (v1 == v2); return 1; }
-  if (str_equal(op, "!=")) { *result = (v1 != v2); return 1; }
-  return 0;
+  if (str_equal(op, "+"))  { r = v1 + v2; }
+  else if (str_equal(op, "-"))  { r = v1 - v2; }
+  else if (str_equal(op, "*"))  { r = v1 * v2; }
+  else if (str_equal(op, "/"))  { if (v2 == 0) return 0; r = v1 / v2; }
+  else if (str_equal(op, "<"))  { *result = (v1 < v2);  return 1; }
+  else if (str_equal(op, ">"))  { *result = (v1 > v2);  return 1; }
+  else if (str_equal(op, "<=")) { *result = (v1 <= v2); return 1; }
+  else if (str_equal(op, ">=")) { *result = (v1 >= v2); return 1; }
+  else if (str_equal(op, "==")) { *result = (v1 == v2); return 1; }
+  else if (str_equal(op, "!=")) { *result = (v1 != v2); return 1; }
+  else return 0;
+
+  if (r > INT_MAX || r < INT_MIN) return 0; /* 溢出 */
+  *result = (int)r;
+  return 1;
 }
 
 /* 常量传播 + 折叠 + 无用分支删除 */
@@ -1553,6 +1374,7 @@ void constant_propagation() {
       } else {
         /* if(非0) → 必定跳转，改为 goto */
         string_clear(q->op); string_append(q->op, "goto");
+        string_clear(q->arg1); string_append(q->arg1, "null");
         q->removed = 0;
         branches_removed++;
         fprintf(outFile, "  [BranchFold] if(%d)→goto %s\n", cond_val, target);
@@ -2243,14 +2065,16 @@ void optimize_strength_reduction() {
   map_free(loops);
 }
 
-// 4.3 循环展开
-// 当前实现：检测循环并输出信息，但不执行展开
-// 完整的循环展开需要同时复制循环体和调整IV，实现较复杂
-// 强度削弱和归纳变量消除已提供主要的循环优化效果
+// 辅助函数前向声明（定义在后面）
+static int get_initial_value(const char *var, int loop_header);
+static int resolve_constant(const char *s, int loop_header);
+
+// 4.3 循环展开：对单基本块、小常量迭代次数的循环进行全展开
 void optimize_loop_unrolling() {
   fprintf(outFile, "\n>>>>>>>> 1.7.3 执行循环展开 <<<<<<<<\n");
   Map *loops = find_loops();
   int loop_count = (int)(intptr_t)map_get(loops, "loop_count", (void *)0);
+  int unrolled_loops = 0;
 
   for (int loop_idx = 0; loop_idx < loop_count; loop_idx++) {
     char loop_header_key[32], loop_back_key[32];
@@ -2258,12 +2082,189 @@ void optimize_loop_unrolling() {
     sprintf(loop_back_key, "loop_%d_back", loop_idx);
     int header = (int)(intptr_t)map_get(loops, loop_header_key, (void *)-1);
     int back = (int)(intptr_t)map_get(loops, loop_back_key, (void *)-1);
-    if (header != -1 && back != -1) {
-      fprintf(outFile, "  [Unroll] 检测到循环 %d: Header=%d Back=%d (暂不展开)\n",
-              loop_idx, header, back);
+    if (header == -1 || back == -1) continue;
+
+    /* 查找循环中的归纳变量、初始值、步长和上界 */
+    const char *iv_var = NULL;
+    int iv_init = 0, iv_stride = 0;
+    const char *iv_limit = NULL;
+    int iv_limit_val = 0;
+    const char *cond_op = NULL;
+
+    /* 在循环头块找比较操作 */
+    BasicBlock *hb = find_block_by_id(header);
+    if (!hb) continue;
+
+    for (int j = 0; j < hb->instructions->size; ++j) {
+      Quad *q = (Quad *)vector_get(hb->instructions, j);
+      if (q->removed) continue;
+      const char *op = string_cstr(q->op);
+      if (str_equal(op, "<") || str_equal(op, ">") ||
+          str_equal(op, "<=") || str_equal(op, ">=")) {
+        iv_var = string_cstr(q->arg1);
+        iv_limit = string_cstr(q->arg2);
+        cond_op = op;
+        iv_limit_val = resolve_constant(iv_limit, header);
+        break;
+      }
     }
+    if (!iv_var || !iv_limit) continue;
+
+    /* 在循环体内找步长: iv = iv + C */
+    for (int bi = 0; bi < blocks->size; ++bi) {
+      BasicBlock *b = (BasicBlock *)vector_get(blocks, bi);
+      if (b->id < header || b->id > back) continue;
+      for (int j = 0; j < b->instructions->size; ++j) {
+        Quad *q = (Quad *)vector_get(b->instructions, j);
+        if (q->removed) continue;
+        if ((str_equal(string_cstr(q->op), "+") || str_equal(string_cstr(q->op), "-")) &&
+            str_equal(string_cstr(q->arg1), iv_var) &&
+            str_equal(string_cstr(q->result), iv_var) &&
+            is_constant(string_cstr(q->arg2))) {
+          iv_stride = atoi(string_cstr(q->arg2));
+          if (str_equal(string_cstr(q->op), "-")) iv_stride = -iv_stride;
+          break;
+        }
+      }
+    }
+    if (iv_stride == 0) {
+      fprintf(outFile, "  [Unroll] 循环 %d: 无法确定IV步长，跳过\n", loop_idx);
+      continue;
+    }
+
+    /* 获取初始值 */
+    iv_init = get_initial_value(iv_var, header);
+
+    /* 计算迭代次数 */
+    int trip_count = 0;
+    if (str_equal(cond_op, "<") && iv_stride > 0)
+      trip_count = (iv_limit_val - iv_init + iv_stride - 1) / iv_stride; /* ceil */
+    else if (str_equal(cond_op, "<=") && iv_stride > 0)
+      trip_count = (iv_limit_val - iv_init) / iv_stride + 1;
+    else if (str_equal(cond_op, ">") && iv_stride < 0)
+      trip_count = (iv_limit_val - iv_init + iv_stride + 1) / iv_stride; /* negative stride */
+    else if (str_equal(cond_op, ">=") && iv_stride < 0)
+      trip_count = (iv_limit_val - iv_init) / iv_stride + 1;
+
+    /* 安全检查：只对单基本块循环（header==back）做展开，避免破坏分支控制流 */
+    if (header != back) {
+      fprintf(outFile, "  [Unroll] 循环 %d: 多基本块循环（Header=%d Back=%d），跳过展开\n",
+              loop_idx, header, back);
+      continue;
+    }
+
+    if (trip_count <= 0 || trip_count > 4) {
+      fprintf(outFile, "  [Unroll] 循环 %d: 迭代次数=%d (超出展开阈值4)，跳过\n",
+              loop_idx, trip_count);
+      continue;
+    }
+
+    /* 收集循环体内所有基本块的指令（排除循环头中的条件判断） */
+    Vector *loop_body = vector_create();
+    for (int bi = 0; bi < blocks->size; ++bi) {
+      BasicBlock *b = (BasicBlock *)vector_get(blocks, bi);
+      if (b->id < header || b->id > back) continue;
+      for (int j = 0; j < b->instructions->size; ++j) {
+        Quad *q = (Quad *)vector_get(b->instructions, j);
+        if (q->removed) continue;
+        /* 排除 label、goto、if、比较指令（循环控制结构） */
+        const char *op = string_cstr(q->op);
+        if (str_equal(op, "label") || str_equal(op, "goto") ||
+            str_equal(op, "if") || str_equal(op, "<") ||
+            str_equal(op, ">") || str_equal(op, "<=") ||
+            str_equal(op, ">=")) continue;
+        /* 排除 IV 更新指令 */
+        if ((str_equal(op, "+") || str_equal(op, "-")) &&
+            str_equal(string_cstr(q->result), iv_var) &&
+            str_equal(string_cstr(q->arg1), iv_var)) continue;
+        vector_push_back(loop_body, q);
+      }
+    }
+
+    if (loop_body->size == 0) {
+      vector_free(loop_body, NULL);
+      continue;
+    }
+
+    fprintf(outFile, "  [Unroll] 展开循环 %d: Header=%d, IV=%s(%d→%d 步长%d), 次数=%d\n",
+            loop_idx, header, iv_var, iv_init, iv_limit_val, iv_stride, trip_count);
+
+    /* 在循环头块中，插入展开后的指令（在 label 之后） */
+    int label_pos = -1;
+    for (int j = 0; j < hb->instructions->size; ++j) {
+      Quad *q = (Quad *)vector_get(hb->instructions, j);
+      if (q->removed) continue;
+      if (str_equal(string_cstr(q->op), "label")) label_pos = j;
+      if (str_equal(string_cstr(q->op), "if")) break;
+    }
+
+    /* 收集循环内部的所有块，之后标记为删除 */
+    Vector *blocks_to_clear = vector_create();
+    for (int bi = 0; bi < blocks->size; ++bi) {
+      BasicBlock *b = (BasicBlock *)vector_get(blocks, bi);
+      if (b->id >= header && b->id <= back) {
+        vector_push_back(blocks_to_clear, b);
+      }
+    }
+
+    /* 标记循环内所有原始指令为删除（包括循环头块中非label的指令） */
+    for (int t = 0; t < blocks_to_clear->size; ++t) {
+      BasicBlock *b = (BasicBlock *)vector_get(blocks_to_clear, t);
+      for (int j = 0; j < b->instructions->size; ++j) {
+        Quad *q = (Quad *)vector_get(b->instructions, j);
+        const char *op = string_cstr(q->op);
+        /* 保留循环头的 label */
+        if (b == hb && str_equal(op, "label")) continue;
+        q->removed = 1;
+      }
+    }
+
+    /* 为每次迭代复制指令 */
+    int insert_pos = (label_pos >= 0) ? label_pos + 1 : 0;
+    char iv_value_str[16];
+    for (int iter = 0; iter < trip_count; ++iter) {
+      int cur_iv = iv_init + iter * iv_stride;
+      sprintf(iv_value_str, "%d", cur_iv);
+
+      for (int t = 0; t < loop_body->size; ++t) {
+        Quad *orig = (Quad *)vector_get(loop_body, t);
+        Quad *copy = quad_copy(orig);
+        copy->removed = 0;
+
+        /* 替换 IV 引用为当前迭代的常量值 */
+        if (str_equal(string_cstr(copy->arg1), iv_var)) {
+          string_clear(copy->arg1);
+          string_append(copy->arg1, iv_value_str);
+        }
+        if (str_equal(string_cstr(copy->arg2), iv_var)) {
+          string_clear(copy->arg2);
+          string_append(copy->arg2, iv_value_str);
+        }
+        if (str_equal(string_cstr(copy->arg3), iv_var)) {
+          string_clear(copy->arg3);
+          string_append(copy->arg3, iv_value_str);
+        }
+
+        vector_insert(hb->instructions, insert_pos, copy);
+        insert_pos++;
+      }
+    }
+
+    /* 标记循环控制 goto 为 deleted */
+    for (int t = 0; t < blocks_to_clear->size; ++t) {
+      BasicBlock *b = (BasicBlock *)vector_get(blocks_to_clear, t);
+      Quad *last = (Quad *)vector_get(b->instructions, b->instructions->size - 1);
+      if (last && str_equal(string_cstr(last->op), "goto")) {
+        last->removed = 1;
+      }
+    }
+
+    unrolled_loops++;
+    vector_free(loop_body, NULL);
+    vector_free(blocks_to_clear, NULL);
   }
 
+  fprintf(outFile, "  [Unroll] 共展开 %d 个循环\n", unrolled_loops);
   map_free(loops);
 }
 
@@ -2357,6 +2358,149 @@ void simplify_instructions() {
   }
 
   fprintf(outFile, "  [Simplify] 共简化 %d 条指令\n", simplified_count);
+}
+
+// ==========================================
+// 5.6 窥孔优化：代数恒等化简、冗余操作消除
+// ==========================================
+
+/* 将数值常量转为整数，非数值返回 0 且设置 valid=0 */
+static int try_parse_int(const char *s, int *valid) {
+  if (!is_constant(s)) { *valid = 0; return 0; }
+  *valid = 1;
+  return atoi(s);
+}
+
+/* 判断是否是同一个变量 */
+static int same_var(const char *a, const char *b) {
+  return is_variable(a) && is_variable(b) && str_equal(a, b);
+}
+
+/* 窥孔优化主函数：扫描每个基本块的指令序列，在局部窗口内化简 */
+void peephole_optimize() {
+  fprintf(outFile, "\n>>>>>>>> 执行窥孔优化 <<<<<<<<\n");
+  int changed_total = 0;
+
+  for (int bi = 0; bi < blocks->size; ++bi) {
+    BasicBlock *b = (BasicBlock *)vector_get(blocks, bi);
+    for (int j = 0; j < b->instructions->size; ++j) {
+      Quad *q = (Quad *)vector_get(b->instructions, j);
+      if (q->removed) continue;
+
+      const char *op  = string_cstr(q->op);
+      const char *a1  = string_cstr(q->arg1);
+      const char *a2  = string_cstr(q->arg2);
+      const char *res = string_cstr(q->result);
+
+      /* 只处理计算指令和赋值 */
+      int is_calc = (str_equal(op, "+") || str_equal(op, "-") ||
+                     str_equal(op, "*") || str_equal(op, "/"));
+      int is_assign = str_equal(op, "=");
+
+      if (!is_calc && !is_assign) continue;
+
+      int v1_valid = 0, v2_valid = 0;
+      int v1 = try_parse_int(a1, &v1_valid);
+      int v2 = try_parse_int(a2, &v2_valid);
+
+      if (is_assign) {
+        /* 规则: (=, x, _, x) 或 (=, c, _, c) — 恒等赋值，删除 */
+        if (str_equal(a1, res)) {
+          q->removed = 1;
+          changed_total++;
+          fprintf(outFile, "  [Peephole] 删除恒等赋值: %s = %s\n", res, a1);
+          continue;
+        }
+        /* 规则: (=, 常量, _, var) — 记录常量值，后续可能允许折叠，暂不处理 */
+        continue;
+      }
+
+      /* --- 以下均为计算指令 --- */
+
+      /* 规则: x + 0 → x, x - 0 → x */
+      if (v2_valid && v2 == 0 && (str_equal(op, "+") || str_equal(op, "-"))) {
+        /* 将指令转为 (=, x, _, res) */
+        string_clear(q->op); string_append(q->op, "=");
+        string_clear(q->arg2); string_append(q->arg2, "_");
+        changed_total++;
+        fprintf(outFile, "  [Peephole] %s %s %d → (=, %s, _, %s)\n", op, a1, v2, a1, res);
+        continue;
+      }
+
+      /* 规则: 0 + x → x */
+      if (v1_valid && v1 == 0 && str_equal(op, "+")) {
+        string_clear(q->op); string_append(q->op, "=");
+        string_clear(q->arg1); string_append(q->arg1, a2);
+        string_clear(q->arg2); string_append(q->arg2, "_");
+        changed_total++;
+        continue;
+      }
+
+      /* 规则: x * 1 → x, x / 1 → x */
+      if (v2_valid && v2 == 1 && (str_equal(op, "*") || str_equal(op, "/"))) {
+        string_clear(q->op); string_append(q->op, "=");
+        string_clear(q->arg2); string_append(q->arg2, "_");
+        changed_total++;
+        continue;
+      }
+
+      /* 规则: 1 * x → x */
+      if (v1_valid && v1 == 1 && str_equal(op, "*")) {
+        string_clear(q->op); string_append(q->op, "=");
+        string_clear(q->arg1); string_append(q->arg1, a2);
+        string_clear(q->arg2); string_append(q->arg2, "_");
+        changed_total++;
+        continue;
+      }
+
+      /* 规则: x * 0 → 0 */
+      if (v2_valid && v2 == 0 && str_equal(op, "*")) {
+        string_clear(q->op); string_append(q->op, "=");
+        string_clear(q->arg1); string_append(q->arg1, "0");
+        string_clear(q->arg2); string_append(q->arg2, "_");
+        changed_total++;
+        continue;
+      }
+
+      /* 规则: 0 * x → 0 */
+      if (v1_valid && v1 == 0 && str_equal(op, "*")) {
+        string_clear(q->op); string_append(q->op, "=");
+        string_clear(q->arg1); string_append(q->arg1, "0");
+        string_clear(q->arg2); string_append(q->arg2, "_");
+        changed_total++;
+        continue;
+      }
+
+      /* 规则: 0 / x → 0 (x ≠ 0) */
+      if (v1_valid && v1 == 0 && str_equal(op, "/")) {
+        string_clear(q->op); string_append(q->op, "=");
+        string_clear(q->arg1); string_append(q->arg1, "0");
+        string_clear(q->arg2); string_append(q->arg2, "_");
+        changed_total++;
+        continue;
+      }
+
+      /* 规则: x - x → 0 */
+      if (same_var(a1, a2) && str_equal(op, "-")) {
+        string_clear(q->op); string_append(q->op, "=");
+        string_clear(q->arg1); string_append(q->arg1, "0");
+        string_clear(q->arg2); string_append(q->arg2, "_");
+        changed_total++;
+        continue;
+      }
+
+      /* 规则: x / x → 1 (x ≠ 0，且两边都是变量) */
+      if (same_var(a1, a2) && str_equal(op, "/")) {
+        string_clear(q->op); string_append(q->op, "=");
+        string_clear(q->arg1); string_append(q->arg1, "1");
+        string_clear(q->arg2); string_append(q->arg2, "_");
+        changed_total++;
+        continue;
+      }
+    }
+  }
+
+  fprintf(outFile, "  [Peephole] 共简化 %d 处\n", changed_total);
 }
 
 // 辅助：查找变量在循环外的常量初始值
@@ -2594,47 +2738,7 @@ void optimize_induction_variable_elimination() {
   map_free(loops);
 }
 
-// ==========================================
-// 6.x Preheader finalize (ensure no backedges to PREHDR_)
-// ==========================================
-void finalize_preheaders() {
-  Map *loops = find_loops();
-  int loop_count = (int)(intptr_t)map_get(loops, "loop_count", (void *)0);
-  for (int loop_idx = 0; loop_idx < loop_count; ++loop_idx) {
-    char loop_header_key[32];
-    char loop_back_key[32];
-    sprintf(loop_header_key, "loop_%d_header", loop_idx);
-    sprintf(loop_back_key, "loop_%d_back", loop_idx);
-    int header = (int)(intptr_t)map_get(loops, loop_header_key, (void *)-1);
-    int back   = (int)(intptr_t)map_get(loops, loop_back_key,   (void *)-1);
-    if (header == -1 || back == -1) continue;
 
-    BasicBlock *hb = find_block_by_id(header);
-    if (!hb) continue;
-    const char *hdr_label = get_block_label(hb);
-    if (!hdr_label) continue;
-
-    // 预期 preheader 名称：PREHDR_<hdr_label>
-    char pre_label[300];
-    snprintf(pre_label, sizeof(pre_label), "PREHDR_%s", hdr_label);
-
-    for (int id = header; id <= back; ++id) {
-      BasicBlock *b = find_block_by_id(id);
-      if (!b) continue;
-      for (int j = 0; j < b->instructions->size; ++j) {
-        Quad *q = (Quad *)vector_get(b->instructions, j);
-        if (str_equal(string_cstr(q->op), "goto") || str_equal(string_cstr(q->op), "if")) {
-          const char *tgt = string_cstr(q->result);
-          if (!str_equal(tgt, "null") && strcmp(tgt, pre_label) == 0) {
-            string_clear(q->result);
-            string_append(q->result, hdr_label);
-          }
-        }
-      }
-    }
-  }
-  map_free(loops);
-}
 
 // ==========================================
 // 7. 文件 IO
@@ -2923,6 +3027,65 @@ void eliminate_dead_code() {
   fprintf(outFile, "  [DCE] 共删除 %d 条死代码指令\n", total_deleted);
 }
 
+// ==========================================
+// 5.7 无用存储消除：同一变量连续两次赋值，消除第一次
+// ==========================================
+void eliminate_dead_stores() {
+  fprintf(outFile, "\n>>>>>>>> 消除无用存储 <<<<<<<<\n");
+  int total_removed = 0;
+  int changed;
+
+  do {
+    changed = 0;
+    for (int bi = 0; bi < blocks->size; ++bi) {
+      BasicBlock *b = (BasicBlock *)vector_get(blocks, bi);
+      for (int j = 0; j < b->instructions->size; ++j) {
+        Quad *q1 = (Quad *)vector_get(b->instructions, j);
+        if (q1->removed) continue;
+
+        /* 只检查赋值指令 */
+        if (!str_equal(string_cstr(q1->op), "=")) continue;
+        const char *var1 = string_cstr(q1->result);
+        if (str_equal(var1, "null") || str_equal(var1, "_")) continue;
+
+        /* 在同一基本块内查找该变量的下一次赋值 */
+        int killed = 0;
+        for (int k = j + 1; k < b->instructions->size && !killed; ++k) {
+          Quad *qk = (Quad *)vector_get(b->instructions, k);
+          if (qk->removed) continue;
+
+          /* 如果该变量在赋值前被使用，则第一次赋值是有效的 */
+          if (str_equal(string_cstr(qk->arg1), var1) ||
+              str_equal(string_cstr(qk->arg2), var1) ||
+              str_equal(string_cstr(qk->arg3), var1)) {
+            break; /* 被使用了，第一次赋值不能删除 */
+          }
+
+          /* 如果遇到对该变量的再次赋值，第一次赋值可以被删除 */
+          if (str_equal(string_cstr(qk->op), "=") &&
+              str_equal(string_cstr(qk->result), var1)) {
+            q1->removed = 1;
+            killed = 1;
+            total_removed++;
+            changed = 1;
+            fprintf(outFile, "  [DeadStore] 删除无用存储: 指令%d %s = %s (被后续赋值覆盖)\n",
+                    q1->id, var1, string_cstr(q1->arg1));
+          }
+
+          /* 如果遇到数组写 =[] 且地址含 var1，视为保守使用 */
+          if (str_equal(string_cstr(qk->op), "=[]") &&
+              (str_equal(string_cstr(qk->arg2), var1) ||
+               str_equal(string_cstr(qk->arg3), var1))) {
+            break;
+          }
+        }
+      }
+    }
+  } while (changed);
+
+  fprintf(outFile, "  [DeadStore] 共删除 %d 条无用存储\n", total_removed);
+}
+
 // 删除无用基本块（DFS可达性分析，不修改CFG）
 void dead_block_elimination() {
   fprintf(outFile, "\n>>>>>>>> 删除无用基本块 <<<<<<<<\n");
@@ -3000,6 +3163,105 @@ void dead_block_elimination() {
   free(reachable);
   free(stack);
   free(id_to_idx);
+}
+
+// ==========================================
+// 5.8 基本块合并：合并相邻的直行（fallthrough）基本块
+// ==========================================
+void merge_basic_blocks() {
+  fprintf(outFile, "\n>>>>>>>> 合并基本块 <<<<<<<<\n");
+  int merged_count = 0;
+
+  /* 构建 id → 向量索引映射 */
+  int n = blocks->size;
+  int *id_to_idx = (int *)malloc((n + 2) * sizeof(int));
+  for (int i = 0; i <= n + 1; ++i) id_to_idx[i] = -1;
+  for (int i = 0; i < n; ++i) {
+    BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
+    if (b) id_to_idx[b->id] = i;
+  }
+
+  /* 扫描：如果块 B 最后一条指令不是 goto/ret/if，
+     且 B+1 存在（连续 ID），合并 */
+  Vector *new_blocks = vector_create();
+  for (int i = 0; i < n; ++i) {
+    BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
+    if (!b) continue;
+
+    /* 检查是否可以与下一块合并 */
+    int can_merge = 0;
+    if (b->instructions->size > 0) {
+      Quad *last = (Quad *)vector_get(b->instructions, b->instructions->size - 1);
+      const char *lop = string_cstr(last->op);
+      if (!str_equal(lop, "goto") && !str_equal(lop, "ret") && !str_equal(lop, "if")) {
+        int next_id = b->id + 1;
+        int next_idx = (next_id <= n + 1) ? id_to_idx[next_id] : -1;
+        if (next_idx >= 0 && next_idx < n) {
+          BasicBlock *next_b = (BasicBlock *)vector_get(blocks, next_idx);
+          /* 确认下一块的唯一前驱是本块（避免破坏多个前驱的CFG） */
+          if (next_b && next_b->predecessors->size <= 1) {
+            can_merge = 1;
+          }
+        }
+      }
+    }
+
+    if (can_merge) {
+      int next_idx = id_to_idx[b->id + 1];
+      BasicBlock *next_b = (BasicBlock *)vector_get(blocks, next_idx);
+
+      /* 将下一块指令追加到当前块（跳过下一块的 label） */
+      for (int j = 0; j < next_b->instructions->size; ++j) {
+        Quad *q = (Quad *)vector_get(next_b->instructions, j);
+        if (!q->removed && !str_equal(string_cstr(q->op), "label")) {
+          vector_push_back(b->instructions, q);
+        }
+      }
+
+      /* 更新 successors：取下一块的后继 */
+      vector_free(b->successors, free);
+      b->successors = vector_create();
+      for (int j = 0; j < next_b->successors->size; ++j) {
+        int *succ = (int *)malloc(sizeof(int));
+        *succ = *(int *)vector_get(next_b->successors, j);
+        vector_push_back(b->successors, succ);
+      }
+
+      merged_count++;
+      fprintf(outFile, "  [Merge] 合并块 %d 和块 %d\n", b->id, next_b->id);
+
+      /* 跳过下一块（不加入 new_blocks） */
+      i = next_idx;
+    }
+
+    vector_push_back(new_blocks, b);
+  }
+
+  /* 替换 blocks 向量 */
+  vector_free(blocks, NULL);
+  blocks = new_blocks;
+
+  /* 重编号块 */
+  for (int i = 0; i < blocks->size; ++i) {
+    BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
+    b->id = i + 1;
+  }
+
+  /* 重建 label 映射 */
+  map_free(labelToBlockId);
+  labelToBlockId = map_create();
+  for (int i = 0; i < blocks->size; ++i) {
+    BasicBlock *b = (BasicBlock *)vector_get(blocks, i);
+    for (int j = 0; j < b->instructions->size; ++j) {
+      Quad *q = (Quad *)vector_get(b->instructions, j);
+      if (str_equal(string_cstr(q->op), "label")) {
+        map_insert(labelToBlockId, string_cstr(q->result), (void*)(intptr_t)b->id);
+      }
+    }
+  }
+
+  free(id_to_idx);
+  fprintf(outFile, "  [Merge] 共合并 %d 对基本块\n", merged_count);
 }
 
 // 将所有preHeader指令移到第一个基本块

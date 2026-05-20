@@ -55,24 +55,29 @@ int main(int argc, char *argv[]) {
   // 执行所有数据流分析（到达-定值、活跃变量、可用表达式等）
   perform_all_analyses();
 
-  // --- 4. 优化阶段 ---
+  // --- 4. 优化阶段（多轮迭代以获取更多机会）---
 
   // 执行跨基本块的公共子表达式消除
   cross_block_cse();
 
-  // 常量传播与折叠（在循环优化之前，以简化循环条件）
+  // 第一轮：常量传播 → 窥孔优化 → 常量传播（窥孔可能暴露新常量）
+  constant_propagation();
+  peephole_optimize();
   constant_propagation();
 
   // 执行循环优化
-  optimize_invariant_code_motion();      // 循环不变量外提
-  optimize_strength_reduction();         // 强度削弱
-  optimize_loop_unrolling();             // 循环展开
-  optimize_induction_variable_elimination(); // 归纳变量删除
+  optimize_invariant_code_motion();            // 循环不变量外提
+  optimize_strength_reduction();               // 强度削弱
+  optimize_loop_unrolling();                   // 循环展开（小常量迭代次数）
+  optimize_induction_variable_elimination();   // 归纳变量删除
 
   // 执行其他全局优化
-  simplify_instructions();      // 合并冗余的临时变量赋值
-  eliminate_dead_code();        // 删除死代码
-  dead_block_elimination();     // 删除不可达基本块
+  simplify_instructions();       // 合并冗余的临时变量赋值
+  peephole_optimize();           // 再次窥孔：指令合并后可能暴露新机会
+  eliminate_dead_stores();       // 消除被覆盖的无用存储
+  eliminate_dead_code();         // 删除死代码
+  dead_block_elimination();      // 删除不可达基本块
+  merge_basic_blocks();          // 合并相邻fallthrough基本块
 
   // --- 5. 清理与输出 ---
 
@@ -93,6 +98,9 @@ int main(int argc, char *argv[]) {
   }
   // 打印优化后的四元式到输出文件
   print_final_result();
+
+  // 关闭输出文件
+  fclose(outFile);
 
   // --- 6. 资源释放 ---
 

@@ -220,9 +220,6 @@ void optimize_loop_unrolling();
 /** @brief 在强度削弱后，尝试删除无用的基本归纳变量 */
 void optimize_induction_variable_elimination();
 
-/** @brief 修正循环回边，确保它们指向循环头而不是preheader */
-void finalize_preheaders();
-
 // ** 文件IO与最终处理 **
 
 /** @brief 清理从文件中读取的行，去除括号和逗号 */
@@ -248,5 +245,14 @@ void print_final_result();
 
 /** @brief 执行指令合并，减少临时变量的使用 */
 void simplify_instructions();
+
+/** @brief 窥孔优化：代数恒等化简、冗余操作消除 */
+void peephole_optimize();
+
+/** @brief 无用存储消除：同一变量连续两次赋值，消除第一次 */
+void eliminate_dead_stores();
+
+/** @brief 基本块合并：合并相邻的 fallthrough 基本块 */
+void merge_basic_blocks();
 
 #endif // OPTIMIZER_H
